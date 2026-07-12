@@ -6,7 +6,6 @@ permissions: {}
 
 on:
   workflow_call: {}
-  workflow_dispatch: {}
 
 jobs:
   assert:
@@ -110,36 +109,9 @@ jobs:
       - name: Create kind cluster and setup Sigstore Scaffolding
         uses: sigstore/scaffolding/actions/setup@8bd68672d418e5bd1b0ee1f2e2981874c3a30967 # v0.7.33
         with:
-          version: main
+          version: v0.7.33
           k8s-version: ${{ matrix.k8s-version }}
           knative-version: "1.10.0"
-      - name: Debug Sigstore setup
-        if: failure()
-        shell: bash
-        run: |
-          echo "===== JOBS ====="
-          kubectl get jobs -A -o wide || true
-
-          echo "===== SIGN JOB ====="
-          kubectl get job sign-job -o yaml || true
-          kubectl describe job sign-job || true
-
-          echo "===== SIGN JOB PODS ====="
-          kubectl get pods -l job-name=sign-job -o wide || true
-          kubectl describe pods -l job-name=sign-job || true
-
-          echo "===== SIGN JOB LOGS ====="
-          kubectl logs job/sign-job --all-containers=true --prefix=true || true
-
-          echo "===== VERIFY JOB ====="
-          kubectl describe job verify-job || true
-          kubectl logs job/verify-job --all-containers=true --prefix=true || true
-
-          echo "===== SIGSTORE PODS ====="
-          kubectl get pods -A -o wide | grep -E 'sign-job|verify-job|rekor|fulcio|tuf|ctlog|trillian|knative' || true
-
-          echo "===== EVENTS ====="
-          kubectl get events -A --sort-by=.lastTimestamp | tail -200 || true
       - name: Create TUF values config map
         run: |
           set -e
