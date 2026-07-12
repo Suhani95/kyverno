@@ -6,6 +6,7 @@ permissions: {}
 
 on:
   workflow_call: {}
+  workflow_dispatch:
 
 jobs:
   assert:
@@ -147,6 +148,26 @@ jobs:
           cosign initialize --mirror $TUF_MIRROR --root $TUF_MIRROR/root.json
           COSIGN_EXPERIMENTAL=1 cosign sign $TEST_IMAGE_URL --identity-token $OIDC_TOKEN --fulcio-url $FULCIO_URL --rekor-url $REKOR_URL -y
           echo "TEST_IMAGE_URL=$TEST_IMAGE_URL" >> $GITHUB_ENV
+      - name: Debug test image
+        shell: bash
+        run: |
+          set -x
+
+          echo "===== ENV ====="
+          echo "TEST_IMAGE_URL=$TEST_IMAGE_URL"
+          echo "TUF_MIRROR=$TUF_MIRROR"
+          echo "FULCIO_URL=$FULCIO_URL"
+          echo "REKOR_URL=$REKOR_URL"
+
+          echo "===== IMAGE ====="
+          crane digest "$TEST_IMAGE_URL" || true
+
+          echo "===== VERIFY ====="
+          COSIGN_EXPERIMENTAL=1 cosign verify \
+            "$TEST_IMAGE_URL" \
+            --certificate-identity=https://kubernetes.io/namespaces/default/serviceaccounts/default \
+            --certificate-oidc-issuer=https://kubernetes.default.svc.cluster.local \
+            --rekor-url "$REKOR_URL" || true
       # run tests
       - name: Test with Chainsaw
         shell: bash
