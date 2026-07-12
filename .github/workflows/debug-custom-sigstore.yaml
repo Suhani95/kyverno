@@ -8,8 +8,39 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  custom-sigstore:
+  build-images:
+    name: Build Kyverno images
     runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Go
+        uses: ./.github/actions/go/setup
+
+      - name: Install Ko
+        uses: ./.github/actions/tools/ko
+
+      - name: Build image archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=${{ github.ref_name }} make docker-save-image-all
+
+      - name: Upload image archive
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: kyverno.tar
+          path: kyverno.tar
+          if-no-files-found: error
+
+  custom-sigstore:
+    name: custom-sigstore (${{ matrix.k8s-version }})
+    needs:
+      - build-images
+    runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
@@ -21,7 +52,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Install tools
+      - name: Install Helm
         uses: ./.github/actions/tools/helm
 
       - name: Install crane
@@ -42,31 +73,121 @@ jobs:
           k8s-version: ${{ matrix.k8s-version }}
           knative-version: "1.10.0"
 
-      - name: Debug Sigstore setup
-        if: always()
+      - name: Create TUF values config map
         shell: bash
         run: |
+          set -euo pipefail
+
+          kubectl create namespace kyverno
+
+          kubectl -n kyverno create configmap tufvalues \
+            --from-literal=TUF_MIRROR="$TUF_MIRROR" \
+            --from-literal=FULCIO_URL="$FULCIO_URL" \
+            --from-literal=REKOR_URL="$REKOR_URL" \
+            --from-literal=CTLOG_URL="$CTLOG_URL" \
+            --from-literal=ISSUER_URL="$ISSUER_URL"
+
+          kubectl -n tuf-system get secret tuf-root -o yaml \
+            | sed 's/namespace: .*/namespace: kyverno/' \
+            | kubectl create -f -
+
+      - name: Download Kyverno image archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: kyverno.tar
+
+      - name: Load Kyverno image archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          kind load image-archive kyverno.tar --name kind
+
+      - name: Install Kyverno
+        shell: bash
+        run: |
+          set -euo pipefail
+          export USE_CONFIG=standard,custom-sigstore
+          make kind-install-kyverno
+
+      - name: Wait for Kyverno
+        uses: ./.github/actions/kyverno/wait-ready
+
+      - name: Create and sign test image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DIGEST=$(crane digest cgr.dev/chainguard/static)
+          IMAGE_NAME=$(uuidgen | tr '[:upper:]' '[:lower:]')
+          TEST_IMAGE_URL="ttl.sh/${IMAGE_NAME}:1h"
+
+          echo "Copying image to $TEST_IMAGE_URL"
+          crane copy \
+            "cgr.dev/chainguard/static@$DIGEST" \
+            "$TEST_IMAGE_URL"
+
+          cosign initialize \
+            --mirror "$TUF_MIRROR" \
+            --root "$TUF_MIRROR/root.json"
+
+          COSIGN_EXPERIMENTAL=1 cosign sign \
+            "$TEST_IMAGE_URL" \
+            --identity-token "$OIDC_TOKEN" \
+            --fulcio-url "$FULCIO_URL" \
+            --rekor-url "$REKOR_URL" \
+            -y
+
+          echo "TEST_IMAGE_URL=$TEST_IMAGE_URL" >> "$GITHUB_ENV"
+
+      - name: Verify test image directly
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "TEST_IMAGE_URL=$TEST_IMAGE_URL"
+          crane digest "$TEST_IMAGE_URL"
+
+          COSIGN_EXPERIMENTAL=1 cosign verify \
+            "$TEST_IMAGE_URL" \
+            --certificate-identity-regexp='.*' \
+            --certificate-oidc-issuer-regexp='.*' \
+            --rekor-url "$REKOR_URL"
+
+      - name: Test with Chainsaw
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd test/conformance/chainsaw/custom-sigstore
+          chainsaw test --config .chainsaw.yaml
+
+      - name: Debug failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "===== TEST IMAGE ====="
+          echo "TEST_IMAGE_URL=${TEST_IMAGE_URL:-unset}"
+
+          echo "===== KYVERNO PODS ====="
+          kubectl get pods -n kyverno -o wide || true
+
           echo "===== JOBS ====="
           kubectl get jobs -A -o wide || true
 
-          echo "===== SIGN JOB ====="
-          kubectl get job sign-job -o yaml || true
-          kubectl describe job sign-job || true
-
-          echo "===== SIGN JOB PODS ====="
-          kubectl get pods -l job-name=sign-job -o wide || true
-          kubectl describe pods -l job-name=sign-job || true
-
-          echo "===== SIGN JOB LOGS ====="
-          kubectl logs job/sign-job --all-containers=true --prefix=true || true
-
-          echo "===== VERIFY JOB ====="
-          kubectl get job verify-job -o yaml || true
-          kubectl describe job verify-job || true
-          kubectl logs job/verify-job --all-containers=true --prefix=true || true
-
           echo "===== SIGSTORE PODS ====="
-          kubectl get pods -A -o wide | grep -E 'sign-job|verify-job|rekor|fulcio|tuf|ctlog|trillian|knative' || true
+          kubectl get pods -A -o wide \
+            | grep -E 'sign-job|verify-job|rekor|fulcio|tuf|ctlog|trillian|knative' \
+            || true
+
+          echo "===== KYVERNO LOGS ====="
+          kubectl logs -n kyverno \
+            -l app.kubernetes.io/component=admission-controller \
+            --all-containers=true \
+            --prefix=true \
+            --tail=500 || true
 
           echo "===== EVENTS ====="
-          kubectl get events -A --sort-by=.lastTimestamp | tail -200 || true
+          kubectl get events -A \
+            --sort-by=.lastTimestamp \
+            | tail -250 || true
