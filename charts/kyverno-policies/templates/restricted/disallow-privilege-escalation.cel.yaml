@@ -35,26 +35,26 @@ spec:
   {{ end }}
   validations:
     - expression: >-
-        (!has(object.spec.containers) || object.spec.containers.all(c, 
-          has(c.securityContext) && 
-          has(c.securityContext.allowPrivilegeEscalation) && 
+        object.spec.?os.?name.orValue('') == 'windows' ||
+        (!has(object.spec.containers) || object.spec.containers.all(c,
+          has(c.securityContext) &&
+          has(c.securityContext.allowPrivilegeEscalation) &&
           c.securityContext.allowPrivilegeEscalation == false)) &&
-        (!has(object.spec.initContainers) || object.spec.initContainers.all(c, 
-          has(c.securityContext) && 
-          has(c.securityContext.allowPrivilegeEscalation) && 
+        (!has(object.spec.initContainers) || object.spec.initContainers.all(c,
+          has(c.securityContext) &&
+          has(c.securityContext.allowPrivilegeEscalation) &&
           c.securityContext.allowPrivilegeEscalation == false)) &&
-        (!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.all(c, 
-          has(c.securityContext) && 
-          has(c.securityContext.allowPrivilegeEscalation) && 
+        (!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.all(c,
+          has(c.securityContext) &&
+          has(c.securityContext.allowPrivilegeEscalation) &&
           c.securityContext.allowPrivilegeEscalation == false))
       message: >-
         Privilege escalation is disallowed. The fields
         spec.containers[*].securityContext.allowPrivilegeEscalation,
         spec.initContainers[*].securityContext.allowPrivilegeEscalation,
         and spec.ephemeralContainers[*].securityContext.allowPrivilegeEscalation
-        must be set to `false`.
+        must be set to `false`. Windows Pods are exempt.
   {{- include "kyverno-policies.policyAuditAnnotations" (dict "name" $name "values" .Values) | nindent 2 }}
   {{- $actions := include "kyverno-policies.policyValidationActions" (dict "name" $name "values" .Values) }}
   validationActions: {{ $actions | nindent 4 }}
 {{- end }}
-

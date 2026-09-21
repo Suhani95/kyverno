@@ -1,0 +1,108 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux-drop-net-raw
+spec:
+  containers:
+  - name: app
+    image: nginx
+    securityContext:
+      capabilities:
+        drop:
+        - NET_RAW
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux-add-sys-admin
+spec:
+  containers:
+  - name: app
+    image: nginx
+    securityContext:
+      capabilities:
+        drop:
+        - ALL
+        add:
+        - SYS_ADMIN
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux-init-drop-net-raw
+spec:
+  initContainers:
+  - name: init
+    image: busybox
+    securityContext:
+      capabilities:
+        drop:
+        - NET_RAW
+  containers:
+  - name: app
+    image: nginx
+    securityContext:
+      capabilities:
+        drop:
+        - ALL
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux-ephemeral-add-sys-admin
+spec:
+  containers:
+  - name: app
+    image: nginx
+    securityContext:
+      capabilities:
+        drop:
+        - ALL
+  ephemeralContainers:
+  - name: debug
+    image: busybox
+    securityContext:
+      capabilities:
+        drop:
+        - ALL
+        add:
+        - SYS_ADMIN
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux-drop-all
+spec:
+  containers:
+  - name: app
+    image: nginx
+    securityContext:
+      capabilities:
+        drop:
+        - ALL
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux-drop-all-add-net-bind-service
+spec:
+  containers:
+  - name: app
+    image: nginx
+    securityContext:
+      capabilities:
+        drop:
+        - ALL
+        add:
+        - NET_BIND_SERVICE
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: windows-no-security-context
+spec:
+  os:
+    name: windows
+  containers:
+  - name: app
+    image: mcr.microsoft.com/windows/servercore:ltsc2022

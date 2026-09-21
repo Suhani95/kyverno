@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: annotation-unconfined
+  annotations:
+    container.apparmor.security.beta.kubernetes.io/app: unconfined
+spec:
+  containers:
+  - name: app
+    image: nginx
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: profile-type-unconfined
+spec:
+  containers:
+  - name: app
+    image: nginx
+    securityContext:
+      appArmorProfile:
+        type: Unconfined
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: annotation-localhost-profile
+  annotations:
+    container.apparmor.security.beta.kubernetes.io/app: localhost/my-profile
+spec:
+  containers:
+  - name: app
+    image: nginx
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: annotation-runtime-default
+  annotations:
+    container.apparmor.security.beta.kubernetes.io/app: runtime/default
+spec:
+  containers:
+  - name: app
+    image: nginx
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: annotation-empty
+  annotations:
+    container.apparmor.security.beta.kubernetes.io/app: ""
+spec:
+  containers:
+  - name: app
+    image: nginx
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: profile-type-localhost
+spec:
+  containers:
+  - name: app
+    image: nginx
+    securityContext:
+      appArmorProfile:
+        type: Localhost
+        localhostProfile: my-profile

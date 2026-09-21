@@ -1,0 +1,23 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: pss-restrict-sysctls
+policies:
+- policy.yaml
+resources:
+- resources.yaml
+results:
+- isValidatingPolicy: true
+  kind: Pod
+  policy: restrict-sysctls
+  resources:
+  - unsafe-sysctl
+  - unsafe-sysctl-mixed-with-safe
+  result: fail
+- isValidatingPolicy: true
+  kind: Pod
+  policy: restrict-sysctls
+  resources:
+  - all-safe-sysctls
+  - no-sysctls
+  result: pass

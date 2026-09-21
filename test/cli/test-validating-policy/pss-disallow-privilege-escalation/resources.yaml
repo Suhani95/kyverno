@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux-escalation-unset
+spec:
+  containers:
+  - name: app
+    image: nginx
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux-escalation-true
+spec:
+  containers:
+  - name: app
+    image: nginx
+    securityContext:
+      allowPrivilegeEscalation: true
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux-os-name-escalation-unset
+spec:
+  os:
+    name: linux
+  containers:
+  - name: app
+    image: nginx
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux-init-escalation-unset
+spec:
+  initContainers:
+  - name: init
+    image: busybox
+  containers:
+  - name: app
+    image: nginx
+    securityContext:
+      allowPrivilegeEscalation: false
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux-escalation-false
+spec:
+  containers:
+  - name: app
+    image: nginx
+    securityContext:
+      allowPrivilegeEscalation: false
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: windows-escalation-unset
+spec:
+  os:
+    name: windows
+  containers:
+  - name: app
+    image: mcr.microsoft.com/windows/servercore:ltsc2022

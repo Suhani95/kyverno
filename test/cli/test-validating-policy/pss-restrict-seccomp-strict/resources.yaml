@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux-seccomp-unset
+spec:
+  containers:
+  - name: app
+    image: nginx
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux-pod-seccomp-unconfined
+spec:
+  securityContext:
+    seccompProfile:
+      type: Unconfined
+  containers:
+  - name: app
+    image: nginx
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux-container-seccomp-unconfined
+spec:
+  containers:
+  - name: app
+    image: nginx
+    securityContext:
+      seccompProfile:
+        type: Unconfined
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux-container-seccomp-runtime-default
+spec:
+  containers:
+  - name: app
+    image: nginx
+    securityContext:
+      seccompProfile:
+        type: RuntimeDefault
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: linux-pod-seccomp-runtime-default
+spec:
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+  - name: app
+    image: nginx
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: windows-seccomp-unset
+spec:
+  os:
+    name: windows
+  containers:
+  - name: app
+    image: mcr.microsoft.com/windows/servercore:ltsc2022

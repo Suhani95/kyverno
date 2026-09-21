@@ -36,23 +36,25 @@ spec:
   {{ end }}
   validations:
     - expression: >-
-        (!has(object.spec.containers) || object.spec.containers.all(c, 
-          !has(c.securityContext) || 
-          !has(c.securityContext.capabilities) || 
+        object.spec.?os.?name.orValue('') == 'windows' ||
+        (!has(object.spec.containers) || object.spec.containers.all(c,
+          !has(c.securityContext) ||
+          !has(c.securityContext.capabilities) ||
           ((!has(c.securityContext.capabilities.drop) || 'ALL' in c.securityContext.capabilities.drop) &&
            (!has(c.securityContext.capabilities.add) || c.securityContext.capabilities.add.all(cap, cap == 'NET_BIND_SERVICE'))))) &&
-        (!has(object.spec.initContainers) || object.spec.initContainers.all(c, 
-          !has(c.securityContext) || 
-          !has(c.securityContext.capabilities) || 
+        (!has(object.spec.initContainers) || object.spec.initContainers.all(c,
+          !has(c.securityContext) ||
+          !has(c.securityContext.capabilities) ||
           ((!has(c.securityContext.capabilities.drop) || 'ALL' in c.securityContext.capabilities.drop) &&
            (!has(c.securityContext.capabilities.add) || c.securityContext.capabilities.add.all(cap, cap == 'NET_BIND_SERVICE'))))) &&
-        (!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.all(c, 
-          !has(c.securityContext) || 
-          !has(c.securityContext.capabilities) || 
+        (!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.all(c,
+          !has(c.securityContext) ||
+          !has(c.securityContext.capabilities) ||
           ((!has(c.securityContext.capabilities.drop) || 'ALL' in c.securityContext.capabilities.drop) &&
            (!has(c.securityContext.capabilities.add) || c.securityContext.capabilities.add.all(cap, cap == 'NET_BIND_SERVICE')))))
       message: >-
         Containers must drop `ALL` capabilities and may only add `NET_BIND_SERVICE`.
+        Windows Pods are exempt.
   {{- include "kyverno-policies.policyAuditAnnotations" (dict "name" $name "values" .Values) | nindent 2 }}
   {{- $actions := include "kyverno-policies.policyValidationActions" (dict "name" $name "values" .Values) }}
   validationActions: {{ $actions | nindent 4 }}
