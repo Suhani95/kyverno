@@ -3,4 +3,4 @@
 # scripts/verify-policies-pss-fixtures.py.
 repository: https://github.com/kubernetes/pod-security-admission
 branch: master
-commit: 6f7a256569b06d7c694974cb498fbbc5eba81904
+commit: 844f926919f0f2178a7e04c4146e0d338382d31a
