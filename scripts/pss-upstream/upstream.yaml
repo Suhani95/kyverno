@@ -3,4 +3,4 @@
 # scripts/verify-policies-pss-fixtures.py.
 repository: https://github.com/Suhani95/pod-security-admission
 branch: e2e/kyverno-sync
-commit: 36a049e80d3ee9f56646153499df3d33083201fb
+commit: 92daafbccadebc55854344c748cd4c67697962c2
