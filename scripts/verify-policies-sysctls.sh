@@ -37,6 +37,8 @@ BASE=(
 V1DOT32=(net.ipv4.tcp_rmem net.ipv4.tcp_wmem)
 # Added in PSA sysctlsAllowedV1Dot37.
 V1DOT37=(net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_notsent_lowat)
+# Added in PSA sysctlsAllowedV1Dot38.
+V1DOT38=(net.ipv4.tcp_ecn)
 
 log() { echo "[verify-policies-sysctls] $*"; }
 fail() { echo "[verify-policies-sysctls] FAIL: $*" >&2; exit 1; }
@@ -72,4 +74,5 @@ check v1.31.0 "${BASE[@]}"
 check v1.32.0 "${BASE[@]}" "${V1DOT32[@]}"
 check v1.36.0 "${BASE[@]}" "${V1DOT32[@]}"
 check v1.37.0 "${BASE[@]}" "${V1DOT32[@]}" "${V1DOT37[@]}"
+check v1.38.0 "${BASE[@]}" "${V1DOT32[@]}" "${V1DOT37[@]}" "${V1DOT38[@]}"
 log "restrict-sysctls allow-list matches PSA at every version gate"
