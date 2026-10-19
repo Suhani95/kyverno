@@ -2,5 +2,5 @@
 # in charts/kyverno-policies are verified against. See
 # scripts/verify-policies-pss-fixtures.py.
 repository: https://github.com/Suhani95/pod-security-admission
-branch: test/kyverno-fixture-mismatch
-commit: 3f50550cf7fd5b53736403f78aac11d6aa7cb3b0
+branch: test/kyverno-go-check-mismatch
+commit: 5dda09c50cdf919cd75565421deee511b0b433fe
