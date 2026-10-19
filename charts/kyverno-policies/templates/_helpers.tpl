@@ -276,5 +276,8 @@ auditAnnotations:
 {{- if semverCompare ">=1.37.0-0" .Capabilities.KubeVersion.Version -}}
 {{- $sysctls = concat $sysctls (list "net.ipv4.tcp_slow_start_after_idle" "net.ipv4.tcp_notsent_lowat") -}}
 {{- end -}}
+{{- if semverCompare ">=1.38.0-0" .Capabilities.KubeVersion.Version -}}
+{{- $sysctls = concat $sysctls (list "net.ipv4.tcp_ecn") -}}
+{{- end -}}
 {{- range $i, $s := $sysctls }}{{ if $i }}, {{ end }}'{{ $s }}'{{ end -}}
 {{- end -}}
