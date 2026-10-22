@@ -585,3 +585,14 @@ no-stale:
 needs-manual-cel:
   color: d93f0b
   description: Upstream PSA change that needs CEL policy changes by hand
+
+# ── PSA release issues (.github/workflows/psa-release-issues.yaml) ───────────
+# Set by scripts/psa-release-issues.py on the issue for a PSA release. The script uses it to find existing issues.
+psa-cel-update:
+  color: 0E8A16
+  description: A Pod Security Admission release that may need PSS CEL policy updates
+
+# Set by scripts/psa-release-issues.py when it can't map a change with confidence.
+needs-manual-review:
+  color: D93F0B
+  description: Changes the PSA release check couldn't map with confidence
