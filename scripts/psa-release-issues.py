@@ -751,6 +751,9 @@ class GitHub:
     def check_allowed(self, method, path, body):
         prefix = f"repos/{re.escape(self.repo)}"
         allowed = (
+            # Reading the repository itself, to check that Issues are on.
+            method == "GET" and path == f"repos/{self.repo}"
+        ) or (
             method in ("GET", "POST") and re.match(rf"^{prefix}/(issues|labels)(\?|/|$)", path)
             and not re.match(rf"^{prefix}/issues/\d+$", path)
         ) or (
@@ -784,6 +787,10 @@ class GitHub:
         if paginate:
             return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
         return json.loads(result.stdout) if result.stdout.strip() else {}
+
+    def issues_enabled(self):
+        """Returns whether the repository has Issues turned on."""
+        return bool((self.request("GET", f"repos/{self.repo}") or {}).get("has_issues"))
 
     def issues(self):
         """Returns [{"number", "body"}] for every open and closed issue with the label."""
@@ -852,6 +859,11 @@ def run(args, github, chart, config, git_bin="git"):
     the baseline from the mirror's tags, and the issue markers record which
     releases already have an issue. A failed or skipped run loses nothing.
     """
+    # With Issues off, listing issues still works but creating one fails, so a
+    # dry run would pass and the real run would fail. Check first, in both.
+    if not github.issues_enabled():
+        raise ReleaseError(f"Issues are turned off in {github.repo}. Turn them on under Settings > General > "
+                           "Features, or run the workflow in another repository.")
     summary, failures = [], []
     with tempfile.TemporaryDirectory(prefix="psa-release-") as tmp:
         repo = Path(tmp) / "upstream"
@@ -911,7 +923,8 @@ def main(argv=None):
     parser.add_argument("--skip-prereleases", dest="include_prereleases", action="store_false",
                         help="skip alpha, beta, and rc releases")
     parser.add_argument("--tag", help="check only this kubernetes-1.* tag")
-    parser.add_argument("--repository", default=DEFAULT_REPOSITORY, help="the PSA mirror (https:// only)")
+    parser.add_argument("--repository", default=DEFAULT_REPOSITORY,
+                        help="the PSA mirror to read, https://github.com/OWNER/REPO (a fork for testing)")
     parser.add_argument("--config", default=str(CONFIG_FILE), help="baseline and check-to-policy map")
     parser.add_argument("--git", default="git", help="path to git")
     args = parser.parse_args(argv)
@@ -919,9 +932,10 @@ def main(argv=None):
         if getattr(args, name) and not TAG_RE.match(getattr(args, name)):
             parser.error(f"--{name} must look like kubernetes-1.<minor>.<patch>")
     try:
-        # The URL goes to git remote add, so allow only HTTPS, not ext:: or file://.
-        if not args.repository.startswith("https://"):
-            raise ReleaseError("--repository must be an https:// URL")
+        # The URL goes to git remote add, and the issue links assume GitHub, so
+        # allow only a GitHub repository URL. A fork works for testing.
+        if not re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository):
+            raise ReleaseError("--repository must look like https://github.com/OWNER/REPO")
         config = load_config(args.config)
         args.since = args.since or config["since"]
         out = Path(args.out)

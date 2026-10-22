@@ -34,6 +34,10 @@ on:
         description: Skip alpha, beta, and rc releases
         type: boolean
         default: false
+      repository:
+        description: For testing, read releases from this PSA fork, such as https://github.com/OWNER/pod-security-admission
+        type: string
+        default: ''
   pull_request:
     branches:
       - main
@@ -106,12 +110,15 @@ jobs:
           TAG: ${{ inputs.tag }}
           SINCE: ${{ inputs.since }}
           SKIP_PRERELEASES: ${{ inputs.skip-prereleases }}
+          # Empty, and so kubernetes/pod-security-admission, unless a manual run sets it.
+          REPOSITORY: ${{ inputs.repository }}
         run: |
           args=(--repo "$REPO" --out "$RUNNER_TEMP/psa-release-out")
           [ "$DRY_RUN" = "true" ] && args+=(--dry-run)
           [ -n "$TAG" ] && args+=(--tag "$TAG")
           [ -n "$SINCE" ] && args+=(--since "$SINCE")
           [ "$SKIP_PRERELEASES" = "true" ] && args+=(--skip-prereleases)
+          [ -n "$REPOSITORY" ] && args+=(--repository "$REPOSITORY")
           rc=0
           "$PSA_PYTHON" scripts/psa-release-issues.py "${args[@]}" > "$RUNNER_TEMP/psa-release.md" || rc=$?
           cat "$RUNNER_TEMP/psa-release.md" >> "$GITHUB_STEP_SUMMARY"
