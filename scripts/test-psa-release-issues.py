@@ -497,12 +497,13 @@ class FakeGitHub(psa.GitHub):
     runs before each issue is stored, to simulate a concurrent run.
     """
 
-    def __init__(self, bodies=(), fail=None, on_create=None):
+    def __init__(self, bodies=(), fail=None, on_create=None, has_issues=True):
         super().__init__("owner/kyverno")
         self.store = [{"number": i + 1, "body": b, "state": "closed"} for i, b in enumerate(bodies)]
         self.labels, self.comments, self.calls = set(), [], []
         self.fail = fail or {}
         self.on_create = on_create
+        self.has_issues = has_issues
 
     def add(self, body, **fields):
         issue = {"number": len(self.store) + 1, "body": body, "state": "open", **fields}
@@ -515,6 +516,8 @@ class FakeGitHub(psa.GitHub):
         for (fail_method, fragment), message in self.fail.items():
             if method == fail_method and fragment in path:
                 raise psa.ReleaseError(message)
+        if method == "GET" and path == f"repos/{self.repo}":
+            return {"full_name": self.repo, "has_issues": self.has_issues}
         if method == "GET" and "/issues?" in path:
             return [dict(i) for i in self.store]
         if method == "GET" and "/labels/" in path:
@@ -634,10 +637,20 @@ class RunTest(Base):
         self.assertEqual(github.comments, [(2, "Duplicate of #1, which another run of this workflow opened first.")])
         self.assertTrue(any("closed the duplicate #2 that a concurrent run caused" in line for line in summary))
 
+    def test_issues_turned_off_fail_every_run_before_any_work(self):
+        # A real fork run hit this: listing worked, but creating failed with HTTP 410.
+        for dry_run in (True, False):
+            github = FakeGitHub(has_issues=False)
+            with self.assertRaisesRegex(psa.ReleaseError, "Issues are turned off in owner/kyverno"):
+                self.run_tool(github, dry_run=dry_run)
+            self.assertEqual([(m, p) for m, p, _ in github.calls], [("GET", "repos/owner/kyverno")])
+            self.assertFalse((self.dir / "out/kubernetes-1.37.0-alpha.1.md").exists())
+
     def test_dry_run_writes_the_issue_and_changes_nothing(self):
         github = FakeGitHub()
         summary, _ = self.run_tool(github, dry_run=True)
-        self.assertEqual([m for m, _, _ in github.calls], ["GET"])
+        # Only reads: the repository settings and the issue list.
+        self.assertEqual([m for m, _, _ in github.calls], ["GET", "GET"])
         body = (self.dir / "out/kubernetes-1.37.0-alpha.1.md").read_text(encoding="utf-8")
         self.assertIn("net.ipv4.tcp_slow_start_after_idle", body)
         self.assertIn("- `v1.37.0-alpha.1` (since `v1.37.0-alpha.0`): would open an issue (dry run, see "
@@ -736,6 +749,11 @@ class GitHubTest(unittest.TestCase):
         github.check_allowed("PATCH", "repos/owner/kyverno/issues/1", {"state": "closed", "state_reason": "duplicate"})
         github.check_allowed("POST", "repos/owner/kyverno/issues/1/comments", {"body": "x"})
         github.check_allowed("GET", "repos/owner/kyverno/issues?labels=psa-cel-update&state=all", None)
+        # The repository itself can be read, to check that Issues are on, but never changed.
+        github.check_allowed("GET", "repos/owner/kyverno", None)
+        for method in ("PATCH", "POST", "DELETE"):
+            with self.assertRaises(psa.ReleaseError):
+                github.check_allowed(method, "repos/owner/kyverno", {"has_issues": True})
         with self.assertRaises(psa.ReleaseError):
             psa.GitHub("not a repo")
 
@@ -846,6 +864,11 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("github.ref_name != github.event.repository.default_branch", check["env"]["DRY_RUN"])
         self.assertNotIn("pull_request", check["if"])
         self.assertEqual(check["needs"], ["test"])
+        # The test-only repository input is empty by default, so scheduled runs read the upstream mirror.
+        self.assertEqual(inputs["repository"]["default"], "")
+        step = next(s for s in check["steps"] if s.get("name") == "Check releases")
+        self.assertEqual(step["env"]["REPOSITORY"], "${{ inputs.repository }}")
+        self.assertIn('[ -n "$REPOSITORY" ] && args+=(--repository "$REPOSITORY")', step["run"])
 
     def test_one_check_job_at_a_time_per_repository(self):
         concurrency = self.jobs["check"]["concurrency"]
@@ -860,11 +883,13 @@ class WorkflowTest(unittest.TestCase):
 
 
 class MainTest(unittest.TestCase):
-    def test_rejects_a_non_https_repository(self):
-        with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()) as out:
-            code = psa.main(["--repo", "owner/kyverno", "--out", tmp, "--repository", "file:///tmp/psa"])
-        self.assertEqual(code, 1)
-        self.assertIn("https://", out.getvalue())
+    def test_accepts_only_a_github_repository_url(self):
+        for url in ["file:///tmp/psa", "ext::sh -c id", "https://gitlab.com/owner/psa",
+                    "https://github.com/owner/psa/extra", "https://github.com/owner", "http://github.com/owner/psa"]:
+            with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()) as out:
+                code = psa.main(["--repo", "owner/kyverno", "--out", tmp, "--repository", url])
+            self.assertEqual(code, 1, url)
+            self.assertIn("must look like https://github.com/OWNER/REPO", out.getvalue(), url)
 
     def test_committed_config_maps_every_check_to_a_template(self):
         config = psa.load_config(psa.CONFIG_FILE)

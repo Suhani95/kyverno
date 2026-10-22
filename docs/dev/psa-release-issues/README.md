@@ -94,6 +94,9 @@ The workflow uses the default `GITHUB_TOKEN` with `contents: read` and `issues: 
 the `psa-cel-update`, `needs-manual-review`, and `area/pss` labels if they don't exist. When a scheduled run
 fails, the `sync-issue` job opens a workflow-failure issue.
 
+The repository must have Issues turned on. Every run, including a dry run, checks this first and fails with a
+clear message when they're off. Forks have Issues off by default.
+
 ## Run the workflow manually
 
 1. Go to **Actions** > **PSA release issues** > **Run workflow**.
@@ -105,6 +108,7 @@ fails, the `sync-issue` job opens a workflow-failure issue.
    | `tag` | none | Checks only this tag, such as `kubernetes-1.37.0-alpha.1` |
    | `since` | none | Overrides the baseline tag |
    | `skip-prereleases` | `false` | Skips alpha, beta, and rc releases |
+   | `repository` | none | For testing only: reads releases from this PSA fork, such as `https://github.com/OWNER/pod-security-admission`, instead of `kubernetes/pod-security-admission` |
 
 1. Click **Run workflow**, and read the job summary.
 
@@ -133,6 +137,26 @@ Only a real run verifies the workflow. Before you rely on it, in a fork:
 1. Run it with `dry-run` cleared and a `tag` that needs an issue, and check the issue and its labels.
 1. Run it again, and check that it doesn't open a second issue.
 1. Set `PSA_CEL_UPDATE_ISSUES` to `true`, and check that a scheduled run starts.
+
+### Test against a PSA fork
+
+To see the whole path from an upstream change to an issue without touching upstream, point a manual run at a
+fork of `kubernetes/pod-security-admission`. Forks don't copy tags, so you add two test tags:
+
+1. In a clone of your PSA fork, check out a real release commit, such as the `kubernetes-1.38.0-alpha.2` tag
+   from `kubernetes/pod-security-admission`, and tag it `kubernetes-1.99.0-alpha.0`. Version 1.99 never becomes
+   a real release, so the test issue's marker never blocks a real one.
+1. Commit a small, clearly labeled change, such as a fake value added to the allowed list in
+   `policy/check_sysctls.go`, and tag it `kubernetes-1.99.0-alpha.1`. Use annotated tags (`git tag -a`).
+1. Push only the two tags to your PSA fork.
+1. In your Kyverno fork, run the workflow with `repository` set to your PSA fork, `tag` set to
+   `kubernetes-1.99.0-alpha.1`, and `dry-run` set. Check the job summary and the issue preview in the artifact.
+1. Run it again with `dry-run` cleared to open the test issue, and once more to check that it doesn't open a second
+   one.
+1. Clean up: close the test issue, and delete the two tags from your PSA fork.
+
+Use `tag`, because your fork doesn't have the baseline tag. The issue's links to `kubernetes/kubernetes` point to
+a release that doesn't exist; the links to the mirror point to your fork.
 
 To run the script locally, you need Python 3 with PyYAML and Git, and the GitHub CLI signed in with access to
 `OWNER/NAME`, the repository that holds the issues:
