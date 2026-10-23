@@ -433,15 +433,13 @@ def unsure(subject, problem, action, config=False):
 
 
 def map_changes(analysis, mapping, chart):
-    """Maps each changed group to Kyverno files. Returns (mapped, uncertain, notes).
+    """Maps each changed group to Kyverno files. Returns (mapped, uncertain).
 
     mapped is a list of dicts per group. uncertain lists, as unsure() dicts,
     the changes that can't be tied to the Kyverno policies with confidence; any
-    of them marks the issue for manual review. notes are the automation's
-    inferences that a person must confirm, such as "the template may already
-    handle this change".
+    of them marks the issue for manual review.
     """
-    mapped, uncertain, notes = [], [], []
+    mapped, uncertain = [], []
     for check_id in analysis.unmapped_checks:
         uncertain.append(unsure(check_id, f"Upstream declares this check, but `checks` in `{CONFIG_NAME}` doesn't map "
                                 "it, so no Kyverno policy is identified for it.",
@@ -489,10 +487,10 @@ def map_changes(analysis, mapping, chart):
                                     config=True))
             continue
         added, gates = signals.get("added_values", []), signals.get("gates", [])
+        # A name match only: under which version gate the template has a value isn't checked.
         entry["missing_values"] = [v for v in added if v not in files["sources"]]
         entry["present_values"] = [v for v in added if v in files["sources"]]
         entry["missing_gates"] = [g for g in gates if g not in files["gates"]]
-        entry["present_gates"] = [g for g in gates if g in files["gates"]]
         # A value that upstream removed but the template still has may need work, so it isn't handled.
         entry["kept_values"] = [v for v in signals.get("removed_values", []) if v in files["sources"]]
         entry["handled"] = (bool(added or gates) and not entry["missing_values"] and not entry["missing_gates"]
@@ -502,17 +500,15 @@ def map_changes(analysis, mapping, chart):
                                     "may have moved.",
                                     f"Confirm that {code(group)} still maps to {code(policy)}, and update `checks` if "
                                     "it moved.", config=True))
-        if entry["handled"]:
-            notes.append(f"Every value and version gate that upstream added to {code(group)} already appears in "
-                         f"{code(files['template'])} or its helpers, so Kyverno may already handle this change.")
-        elif any(c["kind"] == "check" for c in items) and not (gates or added or signals.get("removed_values")):
+        code_changed = any(c["kind"] == "check" for c in items)
+        if not entry["handled"] and code_changed and not (gates or added or signals.get("removed_values")):
             # The heuristics found nothing, which doesn't mean nothing changed.
             entry["no_signals"] = True
             uncertain.append(unsure(group, "The check code changed, but the diff shows no version gate or value "
                                     "change, so the automation can't tell whether behavior changed.",
                                     f"Read the {code(group)} code changes in the comparison, and decide whether "
                                     f"{code(policy)} needs an update."))
-    return mapped, uncertain, notes
+    return mapped, uncertain
 
 
 def code(value):
@@ -532,6 +528,19 @@ def utc(date):
     return date.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if date else "unknown"
 
 
+def plural(count, word):
+    return f"{count} {word}" + ("" if count == 1 else "s")
+
+
+def sysctls_versions(entry, minor):
+    """Returns the versions, such as ["1.38"], that scripts/verify-policies-sysctls.sh must check for a change.
+
+    The script checks a fixed list of names at each version it lists, so it
+    covers a change only when it lists the version where upstream gates it.
+    """
+    return entry["signals"].get("gates") or [minor]
+
+
 def needs_update(entry):
     """True for a mapped policy whose template lacks an upstream change, or whose upstream fixtures changed."""
     return bool(entry["files"]) and not (entry.get("test_only") or entry.get("handled") or entry.get("no_signals"))
@@ -548,6 +557,8 @@ def issue_kind(mapped, uncertain):
 
 KIND_NAMES = {"update": "Update required", "confirm": "Confirmation required", "manual": "Manual review required"}
 CODE_KINDS = ("check", "shared", "api")
+SYSCTLS_POLICY = "restrict-sysctls"
+SYSCTLS_SCRIPT = "scripts/verify-policies-sysctls.sh"
 
 
 def category(change):
@@ -579,12 +590,12 @@ def group_name(group):
     return {"shared": "shared `policy/` code", "api": "`api/`"}.get(group, code(group))
 
 
-def render_issue(analysis, mapped, uncertain, notes, repository, min_kube=None):
+def render_issue(analysis, mapped, uncertain, repository, min_kube=None):
     """Returns (title, body) for a release with upstream changes.
 
-    The body keeps three things apart: what the upstream diff shows (What
-    changed), what the automation mapped or couldn't map (Kyverno impact), and
-    what it only infers (Assessment). Actions and validation follow the issue
+    The body keeps apart what the upstream diff shows (What changed) and what
+    the automation mapped, couldn't map, or only infers (Kyverno impact, where
+    an inference is labeled as one). Actions and validation follow the issue
     kind, so a confirm issue never asks for policy work. min_kube is the
     oldest Kubernetes version the chart supports, such as "1.25".
     """
@@ -607,11 +618,18 @@ def render_issue(analysis, mapped, uncertain, notes, repository, min_kube=None):
         action = (f"Update {listed(e['policy'] for e in updates)} to match upstream, then run the checks under "
                   "**Validation**.")
     elif kind == "confirm":
-        reason = "the templates already seem to handle it" if handled else "only upstream test code changed"
-        action = f"Confirm that no CEL change is needed, because {reason}, and record the outcome in this issue."
+        reasons = []
+        if handled:
+            reasons.append("the templates already seem to handle the upstream changes to "
+                           + listed(e["group"] for e in handled))
+        if test_only:
+            reasons.append("only test code changed for " + listed(test_only))
+        reasons = reasons or ["the automation found no change that needs an update"]
+        action = (f"Confirm that no CEL change is needed, because {' and '.join(reasons)}, and record the outcome in "
+                  "this issue.")
     else:
-        action = (f"Resolve the {len(uncertain)} item(s) under **Not mapped**, then decide whether a policy needs an "
-                  "update.")
+        action = (f"Resolve the {plural(len(uncertain), 'item')} under **Not mapped**, then decide whether a policy "
+                  "needs an update.")
     lines = [
         "## Summary", "",
         f"- **Release:** Kubernetes {code(rel.version)}, compared with {code(prev.version)}",
@@ -653,20 +671,21 @@ def render_issue(analysis, mapped, uncertain, notes, repository, min_kube=None):
             fixtures = [c for c in entry["items"] if c["kind"] == "fixture"]
             levels = sorted({c["level"] for c in fixtures})
             versions = sorted({c["version"] for c in fixtures}, key=lambda v: int(v.split(".")[1]))
-            lines.append(f"  - {group_name(entry['group'])}: {len(fixtures)} fixture(s) for {listed(versions)} "
+            lines.append(f"  - {group_name(entry['group'])}: {plural(len(fixtures), 'fixture')} for {listed(versions)} "
                          f"({', '.join(levels)})")
     if by_category["tests"]:
         count = sum(1 for e in by_category["tests"] for c in e["items"] if category(c) == "tests")
-        lines.append(f"- **Test code:** {count} file(s) for {listed(e['group'] for e in by_category['tests'])}")
+        lines.append(f"- **Test code:** {plural(count, 'file')} for "
+                     f"{listed(e['group'] for e in by_category['tests'])}")
     if analysis.new_versions:
-        lines.append(f"- **Left out:** {analysis.copied} fixture(s) under the new {listed(analysis.new_versions)}, "
-                     "because they're unchanged copies of the previous version.")
+        lines.append(f"- **Left out:** {plural(analysis.copied, 'fixture')} under the new "
+                     f"{listed(analysis.new_versions)}, because they're unchanged copies of the previous version.")
     if by_category["code"]:
         lines += ["", "Version gates and values are string matches from the Go diff (`MajorMinorVersion(1, N)` calls "
                   "and string literals), not a semantic analysis."]
     lines.append("")
 
-    # Kyverno impact: the mapping results, the changes that couldn't be mapped, and the inferences.
+    # Kyverno impact: the mapping results, and the changes that couldn't be mapped.
     lines += ["## Kyverno impact", ""]
     with_files = [e for e in mapped if e["files"] and not e.get("test_only")]
     for entry in with_files:
@@ -674,7 +693,8 @@ def render_issue(analysis, mapped, uncertain, notes, repository, min_kube=None):
         if entry.get("no_signals"):
             status = "impact unknown, see **Not mapped**"
         elif entry.get("handled"):
-            status = "may already handle the change"
+            status = ("may already handle the change. This is an inference: every name and version gate that upstream "
+                      "added appears in the template or its helpers.")
         else:
             status = "needs an update"
         lines += [
@@ -685,10 +705,10 @@ def render_issue(analysis, mapped, uncertain, notes, repository, min_kube=None):
             f"  - Version gates in the template: {listed('>=' + g for g in files['gates'])}",
             f"  - CLI tests: {listed(files['tests'], 'none found')}",
         ]
-        present = entry.get("present_values", []) + [">=" + g for g in entry.get("present_gates", [])]
         missing = entry.get("missing_values", []) + [">=" + g for g in entry.get("missing_gates", [])]
-        if present:
-            lines.append(f"  - Already in the template or its helpers: {listed(present)}")
+        if entry.get("present_values"):
+            lines.append(f"  - Names already in the template or its helpers: {listed(entry['present_values'])}. "
+                         "Under which version gate isn't checked.")
         if missing:
             lines.append(f"  - Not in the template or its helpers: {listed(missing)}")
         if entry.get("kept_values"):
@@ -701,12 +721,10 @@ def render_issue(analysis, mapped, uncertain, notes, repository, min_kube=None):
     if test_only:
         if with_files or uncertain:
             lines.append("")
+        them = "it" if len(test_only) == 1 else "them"
         lines.append(f"**Test code only:** {listed(test_only)}. The automation found no check code or fixture change "
-                     "for these, so it lists no CEL template for them. That doesn't rule out a behavior change that "
-                     "the tests encode.")
-    if notes:
-        lines += ["", "**Assessment.** These are inferences, not verified results:", ""]
-        lines += [f"- {note}" for note in notes]
+                     f"for {them}, so it lists no CEL template for {them}. That doesn't rule out a behavior change "
+                     "that the tests encode.")
     lines.append("")
 
     lines += ["## Required actions", ""]
@@ -721,6 +739,11 @@ def render_issue(analysis, mapped, uncertain, notes, repository, min_kube=None):
         for value in entry["kept_values"]:
             lines.append(f"  - [ ] Decide whether {code(value)}, which upstream removed, must stay for older "
                          "Kubernetes versions.")
+        if entry["policy"] == SYSCTLS_POLICY:
+            # Without a line for the new version, make verify-policies-sysctls passes without checking the change.
+            checks = " and ".join(f"`check v{v}.0`" for v in sysctls_versions(entry, minor))
+            lines.append(f"  - [ ] Update the expected names in `{SYSCTLS_SCRIPT}`, with a {checks} line, so "
+                         "`make verify-policies-sysctls` checks this change.")
         if not any(c["kind"] == "check" for c in entry["items"]):
             versions = sorted({c["version"] for c in entry["items"] if c["kind"] == "fixture"},
                               key=lambda v: int(v.split(".")[1]))
@@ -743,24 +766,34 @@ def render_issue(analysis, mapped, uncertain, notes, repository, min_kube=None):
                      "the update.")
     lines.append("")
 
+    def fixture_check(entries, policy):
+        # Only the sysctls allow-list has a command that compares the chart with upstream.
+        how = ("`make verify-policies-sysctls` checks the sysctls allow-list; compare any other fixture by hand."
+               if any(e["policy"] == SYSCTLS_POLICY for e in entries) else
+               "No command runs them against the PSS policies, so compare them by hand.")
+        return (f"- [ ] Each upstream `pass` and `fail` fixture in `test/testdata/*/v{minor}/` for "
+                f"{listed(e['group'] for e in entries)} gets the same result from {policy}. {how}")
+
+    def sysctls_check(entry):
+        versions = " and ".join(f"`v{v}.0`" for v in sysctls_versions(entry, minor))
+        return f"- [ ] `make verify-policies-sysctls` passes, and its output lists {versions}."
+
     lines += ["## Validation", ""]
     if updates:
-        lines.append(f"- [ ] Each upstream `pass` and `fail` fixture in `test/testdata/` for "
-                     f"{listed(e['group'] for e in updates)} at {code(rel.version)} gets the same result from the "
-                     "updated policy.")
+        lines.append(fixture_check(updates, "the updated policy"))
         lines.append("- [ ] The PSS CLI tests pass with `make test-cli-local-vpols`.")
         gated = sorted({g for e in updates for g in e["signals"].get("gates", [])}, key=lambda v: int(v.split(".")[1]))
         if gated:
             lines.append(f"- [ ] Behavior that starts at Kubernetes {listed(gated)} is gated with `semverCompare`, "
                          "so older versions keep the old behavior.")
-        if any(e["policy"] == "restrict-sysctls" for e in updates):
-            lines.append("- [ ] `make verify-policies-sysctls` passes.")
-        oldest = f"`--kube-version {min_kube}.0`" if min_kube else "the oldest Kubernetes version the chart supports"
+        lines += [sysctls_check(e) for e in updates if e["policy"] == SYSCTLS_POLICY]
+        oldest = f"`--kube-version v{min_kube}.0`" if min_kube else "the oldest Kubernetes version the chart supports"
         lines.append(f"- [ ] `helm template charts/kyverno-policies` renders with {oldest} and with "
-                     f"`--kube-version {minor}.0`.")
+                     f"`--kube-version v{minor}.0`.")
     for entry in handled:
-        lines.append(f"- [ ] Each upstream `pass` and `fail` fixture in `test/testdata/` for {code(entry['group'])} at "
-                     f"{code(rel.version)} gets the same result from {code(entry['policy'])}.")
+        lines.append(fixture_check([entry], code(entry["policy"])))
+        if entry["policy"] == SYSCTLS_POLICY:
+            lines.append(sysctls_check(entry))
     if uncertain:
         lines.append("- [ ] Each item under **Not mapped** is resolved: mapped in `checks`, ruled out, or tracked in a "
                      "follow-up issue.")
@@ -972,8 +1005,8 @@ def run(args, github, chart, config, git_bin="git"):
                 if created >= MAX_ISSUES_PER_RUN:
                     summary.append(f"{line}: waits for the next run (limit of {MAX_ISSUES_PER_RUN} issues per run)")
                     continue
-                mapped, uncertain, notes = map_changes(analysis, config, chart)
-                title, body = render_issue(analysis, mapped, uncertain, notes, args.repository, chart.min_kube)
+                mapped, uncertain = map_changes(analysis, config, chart)
+                title, body = render_issue(analysis, mapped, uncertain, args.repository, chart.min_kube)
                 labels = [LABEL, "area/pss"] + ([MANUAL_LABEL] if uncertain else [])
                 review = {"manual": " (manual review)", "confirm": " (confirm only)",
                           "update": ""}[issue_kind(mapped, uncertain)]

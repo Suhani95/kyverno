@@ -67,9 +67,9 @@ Every issue has the same sections, in this order:
 | Summary | The release, the issue type, and the recommended action |
 | Release details | The release and the previous minor, the publish time in UTC, and the source and comparison links |
 | What changed | What the upstream diff shows, split into code, fixtures, and test code, and the copied fixtures left out |
-| Kyverno impact | Each mapped policy with its template, helpers, gates, and CLI tests; the changes under **Not mapped**; and the automation's inferences under **Assessment** |
+| Kyverno impact | Each mapped policy with its template, helpers, gates, and CLI tests, and the changes under **Not mapped**. "May already handle the change" is labeled as an inference: the script matches value names, but doesn't check under which version gate the template has them. |
 | Required actions | A checklist for the issue type. A confirm issue asks only to confirm and record the outcome. |
-| Validation | Checks for the actions, such as matching the upstream fixtures, `make test-cli-local-vpols`, `semverCompare` gates, `make verify-policies-sysctls` for `restrict-sysctls`, and `helm template` with the chart's oldest and the new Kubernetes version. An issue lists only the checks that apply. |
+| Validation | Checks for the actions, such as matching the upstream fixtures, `make test-cli-local-vpols`, `semverCompare` gates, and `helm template` with the chart's oldest and the new Kubernetes version. An issue lists only the checks that apply. No command runs the upstream fixtures against the PSS policies except `make verify-policies-sysctls`, which checks the `restrict-sysctls` allow-list at each version that `scripts/verify-policies-sysctls.sh` lists. A sysctls update therefore also asks for a line for the new version in that script. |
 | Upstream evidence | The upstream commits and the changed files, with links to the comparison |
 
 An issue generated from a PSA fork, rather than `kubernetes/pod-security-admission`, says so in its summary.
