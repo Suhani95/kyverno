@@ -37,31 +37,42 @@ semantic analysis, so read the comparison before you decide. The issue doesn't i
 comparison, and each changed Go file links to its section of it.
 
 When the template already has every added value and gate, and doesn't keep a value that upstream removed, the
-issue asks a person to confirm the change, and to confirm that a CLI test covers it. When it has only some of
-them, the issue lists what's already there and asks only for the rest.
+issue asks a person to confirm the change. When it has only some of them, the issue lists what's already there and
+asks only for the rest.
 
 ### Issue kinds
 
 | Kind | Title ends with | `needs-manual-review` | When |
 |---|---|---|---|
-| Manual review | `review the PSS CEL policies (manual review)` | Yes | A change can't be mapped with confidence |
-| Update | `update the PSS CEL policies` | No | Every change maps, and at least one needs an update |
-| Confirm | `confirm the PSS CEL policies need no change` | No | Only test code changed, or the templates already seem to handle the change |
+| Update required | `update the PSS CEL policies` | No | A mapped template lacks an upstream value or version gate, or the upstream fixtures for its check changed |
+| Confirmation required | `confirm the PSS CEL policies need no change` | No | Only test code changed, or the templates already seem to handle the change |
+| Manual review required | `review the PSS CEL policies (manual review)` | Yes | A change can't be mapped or analyzed with confidence |
 
-These changes are uncertain, and appear under **Uncertain mappings**:
+These changes need manual review, and appear under **Not mapped**:
 
 - Shared `policy/` code, such as `helpers.go`, or base fixtures, which can affect every check.
 - A change in `api/`.
 - An upstream check ID that isn't in `checks`, or an entry in `checks` that upstream no longer declares. The
   script compares them whenever a release changes a check file.
 - A check file that was renamed or split, or a mapped policy without a template.
+- A check code change in which the script finds no version gate or value change. A code diff alone doesn't show
+  that behavior changed, so the issue doesn't ask for an update.
 
-These changes appear under **Review notes**, for a person to confirm:
+### Issue structure
 
-- Test code only, with no fixture change, such as a regenerated fixture generator. The **Changed controls**
-  table gives them one line, not a row each, and lists code changes before fixture-only changes.
-- Values and version gates that already appear in the template or its helpers.
-- A check code change in which the script finds no gate or value change.
+Every issue has the same sections, in this order:
+
+| Section | Contents |
+|---|---|
+| Summary | The release, the issue type, and the recommended action |
+| Release details | The release and the previous minor, the publish time in UTC, and the source and comparison links |
+| What changed | What the upstream diff shows, split into code, fixtures, and test code, and the copied fixtures left out |
+| Kyverno impact | Each mapped policy with its template, helpers, gates, and CLI tests; the changes under **Not mapped**; and the automation's inferences under **Assessment** |
+| Required actions | A checklist for the issue type. A confirm issue asks only to confirm and record the outcome. |
+| Validation | Checks for the actions, such as matching the upstream fixtures, `make test-cli-local-vpols`, `semverCompare` gates, `make verify-policies-sysctls` for `restrict-sysctls`, and `helm template` with the chart's oldest and the new Kubernetes version. An issue lists only the checks that apply. |
+| Upstream evidence | The upstream commits and the changed files, with links to the comparison |
+
+An issue generated from a PSA fork, rather than `kubernetes/pod-security-admission`, says so in its summary.
 
 Upstream text can't ping anyone or link elsewhere: commit subjects are in code spans, the issue links commits
 rather than pull requests, and no upstream code goes into the issue body.
@@ -112,9 +123,9 @@ Only a run of the default branch opens issues.
 
 ## Handle an issue
 
-1. Read **Changed controls** and **Uncertain mappings**, and open the comparison for each changed Go file.
-1. Make the changes under **Required updates** in a pull request that references the issue.
-1. Check each item under **Acceptance criteria**, such as `make test-cli`.
+1. Read **What changed** and **Kyverno impact**, and open the comparison for each changed Go file.
+1. Do the items under **Required actions**. For a policy change, open a pull request that references the issue.
+1. Check each item under **Validation**.
 1. Close the issue. A closed issue is never reopened or recreated.
 
 To move the baseline, change `since` to a minor release whose changes the chart already handles. When upstream adds a
