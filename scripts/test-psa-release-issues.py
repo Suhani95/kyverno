@@ -17,6 +17,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -47,14 +48,21 @@ CHECK_SYSCTLS = LICENSE + (
 )
 
 
-def check_sysctls(gates="", values=""):
-    # Go braces rule out str.format.
-    return CHECK_SYSCTLS.replace("@GATES@", gates).replace("@VALUES@", values)
+def check_sysctls(gate=None, values=()):
+    """Returns check_sysctls.go with an optional 1.<gate> version gate and extra allowed values."""
+    gates = f"\t\t\t{{MinimumVersion: api.MajorMinorVersion(1, {gate}), CheckPod: sysctlsV1Dot{gate}}},\n"
+    gates = gates if gate else ""
+    # Go braces rule out str.format on the template.
+    return CHECK_SYSCTLS.replace("@GATES@", gates).replace("@VALUES@", "".join(f'\t"{v}",\n' for v in values))
 
 
 CHECK_CAPS = 'package policy\n\nfunc CheckCapabilitiesBaseline() Check { return Check{ID: "capabilities_baseline"} }\n'
 FIXTURE = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\nspec: {{}}\n"
 K8S_SHA = "b" * 40
+# The synthetic mirror's URL. It isn't the upstream mirror, so the issues say they may describe a test release.
+TEST_MIRROR = "https://example.com/psa"
+SECTIONS = ["Summary", "Release details", "What changed", "Kyverno impact", "Required actions", "Validation",
+            "Upstream evidence"]
 
 HELPERS = '''{{- define "kyverno-policies.labels" -}}
 app: kyverno
@@ -96,7 +104,7 @@ class Upstream:
         path.mkdir(parents=True)
         self.run("init", "-q", "-b", "master")
         self.write({
-            "policy/check_sysctls.go": check_sysctls(gates="", values=""),
+            "policy/check_sysctls.go": check_sysctls(),
             "policy/check_capabilities_baseline.go": CHECK_CAPS,
             "policy/helpers.go": "package policy\n",
             "policy/check_sysctls_test.go": "package policy\n",
@@ -134,13 +142,15 @@ class Upstream:
         self.run("commit", "-q", "--allow-empty", "-m", f"{message}\n\n{body}")
         return self.run("rev-parse", "HEAD")
 
-    def release(self, version, days_ago=1, branch_from=None):
+    def release(self, version, days_ago=1, branch_from=None, files=None, message="Change"):
         """Tags a release the way the publishing bot does: on a side commit that bumps go.mod.
 
-        With branch_from, the release goes on a release branch cut from that
-        tag, like a patch release.
+        files are committed to master first. With branch_from, the release
+        goes on a release branch cut from that tag, like a patch release.
         """
         self.when = int((datetime.now(timezone.utc) - timedelta(days=days_ago)).timestamp())
+        if files:
+            self.commit(message, files)
         head = self.run("rev-parse", "HEAD")
         self.run("checkout", "-q", "--detach", branch_from or head)
         sha = self.commit(f"Update dependencies to v0.{version} tag", {"go.mod": f"module psa // {version}\n"}, body="")
@@ -184,32 +194,52 @@ class Base(unittest.TestCase):
         by_tag = {r.tag: r for r in releases}
         return psa.analyze("git", repo, by_tag[tag], by_tag[previous], checks or CONFIG["checks"])
 
+    def issue(self, tag="kubernetes-1.38.0", previous="kubernetes-1.37.0", config=CONFIG, repository=TEST_MIRROR,
+              min_kube=None):
+        """Analyzes, maps, and renders one release. Returns all the results, and the body split into sections."""
+        analysis = self.analyze(tag, previous, config["checks"])
+        mapped, uncertain = psa.map_changes(analysis, config, self.chart)
+        title, body = psa.render_issue(analysis, mapped, uncertain, repository, min_kube)
+        parts = re.split(r"^## (.+)$", body, flags=re.MULTILINE)
+        issue = SimpleNamespace(analysis=analysis, mapped=mapped, uncertain=uncertain, title=title,
+                                kind=psa.issue_kind(mapped, uncertain), body=body,
+                                sections=dict(zip(parts[1::2], parts[2::2])))
+        # Every issue kind shares the same structure, and never contradicts its own mapping.
+        self.assertEqual(list(issue.sections), SECTIONS)
+        self.assertIn(f"**Issue type:** {psa.KIND_NAMES[issue.kind]}", issue.sections["Summary"])
+        self.assertNotIn("Every change maps", body)
+        # Counts read as "1 fixture" or "3 files", never "file(s)".
+        self.assertNotIn("(s)", body)
+        self.assertEqual("**Not mapped.**" in issue.sections["Kyverno impact"], bool(uncertain))
+        self.assertTrue(body.endswith(psa.marker(analysis.release)))
+        return issue
+
+    def change(self, files=None, message="Change", **options):
+        """Releases v1.37.0, commits files, releases v1.38.0, and returns the issue for v1.38.0."""
+        self.upstream.release("37.0", days_ago=3)
+        self.upstream.release("38.0", days_ago=2, files=files, message=message)
+        return self.issue(**options)
+
+    def assertAllIn(self, texts, body):
+        for text in texts:
+            self.assertIn(text, body)
+
 
 class ReleaseTest(unittest.TestCase):
-    def rels(self, *versions):
-        return [psa.Release(f"kubernetes-1.{v}") for v in versions]
-
-    def prev(self, version, releases, include=True):
-        found = psa.previous_release(psa.Release(f"kubernetes-1.{version}"), releases, include)
-        return found.version if found else None
-
-    def test_parses_and_orders_tags(self):
+    def test_parses_only_minor_releases_in_order(self):
         text = "\n".join(f"kubernetes-1.{v}\x1f2026-01-01T00:00:00+00:00" for v in
-                         ["37.0", "37.0-rc.0", "37.0-alpha.1", "36.9", "37.0-beta.0", "37.1"]) + "\nv0.37.1\x1f\n"
-        self.assertEqual([r.version for r in psa.parse_releases(text)],
-                         ["v1.36.9", "v1.37.0-alpha.1", "v1.37.0-beta.0", "v1.37.0-rc.0", "v1.37.0", "v1.37.1"])
-        self.assertEqual(psa.Release("kubernetes-1.37.1").psa_tag, "v0.37.1")
+                         ["38.0", "38.0-rc.0", "37.0-alpha.1", "36.9", "37.0", "36.0", "37.1"]) + "\nv0.37.0\x1f\n"
+        # Patches, pre-releases, and v0.* tags are skipped.
+        self.assertEqual([r.version for r in psa.parse_releases(text)], ["v1.36.0", "v1.37.0", "v1.38.0"])
+        self.assertEqual(psa.Release("kubernetes-1.37.0").psa_tag, "v0.37.0")
+        with self.assertRaises(ValueError):
+            psa.Release("kubernetes-1.37.1")
 
-    def test_previous_release(self):
-        all_ = self.rels("36.0", "36.1", "37.0-alpha.0", "37.0-alpha.1", "37.0-rc.0", "37.0", "37.1", "37.2")
-        self.assertEqual(self.prev("37.2", all_), "v1.37.1")
-        self.assertEqual(self.prev("37.1", all_), "v1.37.0")
-        self.assertEqual(self.prev("37.0-rc.0", all_), "v1.37.0-alpha.1")
-        self.assertEqual(self.prev("37.0-alpha.0", all_), "v1.36.0")
-        # A new minor follows its last pre-release, or the previous minor without them.
-        self.assertEqual(self.prev("37.0", all_), "v1.37.0-rc.0")
-        self.assertEqual(self.prev("37.0", all_, include=False), "v1.36.0")
-        self.assertIsNone(self.prev("40.0", all_))
+    def test_previous_release_is_the_previous_minor(self):
+        releases = [psa.Release(f"kubernetes-1.{m}.0") for m in (36, 37, 39)]
+        self.assertEqual(psa.previous_release(releases[1], releases).version, "v1.36.0")
+        # A missing minor is never skipped over.
+        self.assertIsNone(psa.previous_release(releases[2], releases))
 
 
 class SignalsTest(unittest.TestCase):
@@ -248,90 +278,107 @@ class ChartTest(Base):
         self.assertEqual(self.chart.lookup("disallow-proc-mount")["tests"], [])
         self.assertIsNone(self.chart.lookup("no-such-policy"))
 
+    def test_minimum_kubernetes_version_comes_from_chart_yaml(self):
+        # The fake chart has no Chart.yaml, so it has no minimum.
+        self.assertIsNone(self.chart.min_kube)
+        (self.dir / "kyverno" / psa.CHART_FILE).write_text('name: x\nkubeVersion: ">=1.25.0-0"\n', encoding="utf-8")
+        self.assertEqual(psa.Chart(self.dir / "kyverno").min_kube, "1.25")
+
 
 class AnalyzeTest(Base):
+    SYSCTLS = f"{psa.TEMPLATES_DIR}/baseline/restrict-sysctls.cel.yaml"
+    SYSCTLS_TEST = f"{psa.CLI_TESTS_DIR}/pss-restrict-sysctls"
+    # Text that only an issue asking for policy work may contain.
+    IMPLEMENTATION = ["- [ ] Update `", "Handle `", "Add or update a CLI test", "semverCompare", "make test-cli",
+                      "helm template", "Update the expected names"]
+
     def test_dependency_only_release_needs_no_action(self):
-        self.upstream.release("37.0", days_ago=3)
-        self.upstream.release("37.1", days_ago=2)
-        analysis = self.analyze("kubernetes-1.37.1", "kubernetes-1.37.0")
-        self.assertFalse(analysis.relevant)
-        self.assertIn("no change", psa.no_action_reason(analysis))
+        issue = self.change()
+        self.assertFalse(issue.analysis.relevant)
+        self.assertIn("no change", psa.no_action_reason(issue.analysis))
 
-    def test_test_code_only_asks_for_confirmation_without_the_manual_label(self):
-        self.upstream.release("37.0", days_ago=3)
-        self.upstream.commit("Refactor tests", {"test/run.go": "package test // v2\n",
-                                                "test/fixtures_test.go": "package test // v2\n",
-                                                "policy/check_sysctls_test.go": "package policy // v2\n"})
-        self.upstream.release("37.1", days_ago=2)
-        analysis = self.analyze("kubernetes-1.37.1", "kubernetes-1.37.0")
+    def test_test_code_only_is_a_confirm_issue_without_implementation_work(self):
+        issue = self.change({"test/run.go": "package test // v2\n", "test/fixtures_test.go": "package test // v2\n",
+                             "policy/check_sysctls_test.go": "package policy // v2\n"})
         # Never "no action needed": a person confirms test-only changes.
-        self.assertTrue(analysis.relevant)
+        self.assertTrue(issue.analysis.relevant)
         # fixtures_test.go tests the generator, so it isn't a check called "test".
-        self.assertEqual(sorted(c["path"] for c in analysis.groups["test-framework"]),
+        self.assertEqual(sorted(c["path"] for c in issue.analysis.groups["test-framework"]),
                          ["test/fixtures_test.go", "test/run.go"])
-        mapped, uncertain, confirm = psa.map_changes(analysis, CONFIG, self.chart)
-        self.assertEqual(sorted(e["group"] for e in mapped), ["sysctls", "test-framework"])
-        self.assertTrue(all(e["test_only"] for e in mapped))
-        self.assertEqual(uncertain, [])
-        self.assertEqual(len(confirm), 1)
-        self.assertEqual(psa.issue_kind(mapped, uncertain), "confirm")
-        title, body = psa.render_issue(analysis, mapped, uncertain, confirm, "https://example.com/psa")
-        self.assertEqual(title, "Pod Security Admission v1.37.1: confirm the PSS CEL policies need no change")
-        self.assertNotIn("Manual review needed", body)
-        self.assertIn("- [ ] Confirm that the test-only changes for 2 group(s) need no CEL change.", body)
-        self.assertNotIn("| Upstream check |", body)
-        self.assertNotIn("Add each new check", body)
+        self.assertEqual(sorted(e["group"] for e in issue.mapped), ["sysctls", "test-framework"])
+        self.assertTrue(all(e["test_only"] for e in issue.mapped))
+        self.assertEqual((issue.uncertain, issue.kind), ([], "confirm"))
+        self.assertEqual(issue.title, "Pod Security Admission v1.38.0: confirm the PSS CEL policies need no change")
+        self.assertIn("because only test code changed for `sysctls`, `test-framework`,", issue.sections["Summary"])
+        self.assertIn("- **Test code:** 3 files for `sysctls`, `test-framework`", issue.sections["What changed"])
+        # Test code isn't mapped to a template, and the issue says why without claiming nothing changed.
+        impact = issue.sections["Kyverno impact"]
+        self.assertIn("**Test code only:** `sysctls`, `test-framework`. The automation found no check code or "
+                      "fixture change for them,", impact)
+        self.assertIn("doesn't rule out a behavior change", impact)
+        self.assertNotIn("Template:", impact)
+        self.assertAllIn(["- [ ] Read the upstream test changes for `sysctls`, `test-framework`",
+                          "- [ ] Comment with the outcome"], issue.sections["Required actions"])
+        self.assertIn("None, unless the review finds a behavior change.", issue.sections["Validation"])
+        for text in self.IMPLEMENTATION + ["verify-policies"]:
+            self.assertNotIn(text, issue.body)
 
-    def test_generator_noise_collapses_and_real_changes_come_first(self):
+    def test_code_fixtures_and_tests_are_listed_apart_and_criteria_follow_the_changes(self):
         # Like upstream 1.35: every fixture generator changed, but only one check's code did.
-        self.upstream.release("37.0-alpha.0", days_ago=3)
-        self.upstream.commit("Regenerate and change sysctls", {
+        issue = self.change({
             "test/fixtures_sysctls.go": "package test // v2\n",
             "test/fixtures_capabilities_baseline.go": "package test // v2\n",
             "test/fixtures_privileged.go": "package test // v2\n",
             "test/testdata/baseline/v1.36/fail/capabilities_baseline0.yaml": FIXTURE.format(name="caps0-v2"),
-            "policy/check_sysctls.go": check_sysctls(
-                gates="\t\t\t{MinimumVersion: api.MajorMinorVersion(1, 37), CheckPod: sysctlsV1Dot37},\n", values=""),
+            "policy/check_sysctls.go": check_sysctls(gate=37),
         })
-        self.upstream.release("37.0-alpha.1", days_ago=2)
-        analysis = self.analyze("kubernetes-1.37.0-alpha.1", "kubernetes-1.37.0-alpha.0")
-        mapped, uncertain, confirm = psa.map_changes(analysis, CONFIG, self.chart)
-        self.assertEqual(uncertain, [])
-        _, body = psa.render_issue(analysis, mapped, uncertain, confirm, "https://example.com/psa")
-        rows = [line for line in body.splitlines() if line.startswith("| `")]
-        # The code change first, then the fixture-only change. No row for test code.
-        self.assertEqual([row.split(" | ")[0] for row in rows], ["| `sysctls`", "| `capabilities_baseline`"])
-        self.assertIn("fixtures only", rows[1])
-        self.assertIn("Test code only, with no fixture change, for 1 group(s): `privileged`.", body)
+        changed = issue.sections["What changed"]
+        self.assertLess(changed.index("**Code:**"), changed.index("**Fixtures:**"))
+        self.assertLess(changed.index("**Fixtures:**"), changed.index("**Test code:**"))
+        self.assertAllIn(["  - `sysctls`: version gate `>=1.37`",
+                          "  - `capabilities_baseline`: 1 fixture for `1.36` (baseline)",
+                          "- **Test code:** 3 files for `capabilities_baseline`, `privileged`, `sysctls`"], changed)
+        # sysctls already has the 1.37 gate; only the fixture change needs work.
+        self.assertEqual(issue.kind, "update")
+        self.assertIn("- `disallow-capabilities` (baseline), mapped from upstream check `capabilities_baseline`: "
+                      "needs an update", issue.sections["Kyverno impact"])
+        self.assertIn("**Test code only:** `privileged`. The automation found no check code or fixture change for "
+                      "it, so it lists no CEL template for it.", issue.sections["Kyverno impact"])
+        actions = issue.sections["Required actions"]
+        self.assertIn("- [ ] Compare `disallow-capabilities` with the changed upstream fixtures for `1.36`", actions)
+        # sysctls is handled: no sysctls work, only its check, and no gate to add.
+        self.assertNotIn(psa.SYSCTLS_SCRIPT, actions)
+        validation = issue.sections["Validation"]
+        self.assertAllIn([
+            "- [ ] The PSS CLI tests pass with `make test-cli-local-vpols`.",
+            # No command covers the capabilities fixtures, and the issue says so.
+            "- [ ] Each upstream `pass` and `fail` fixture in `test/testdata/*/v1.38/` for `capabilities_baseline` "
+            "gets the same result from the updated policy. No command runs them against the PSS policies, so compare "
+            "them by hand.",
+            "- [ ] `make verify-policies-sysctls` passes, and its output lists `v1.37.0`.",
+        ], validation)
+        self.assertNotIn("semverCompare", validation)
 
     def test_copied_fixture_version_needs_no_action(self):
-        self.upstream.release("37.0", days_ago=3)
-        self.upstream.commit("Regenerate fixtures for v1.37", {
+        issue = self.change({
             "test/testdata/baseline/v1.37/pass/sysctls0.yaml": FIXTURE.format(name="sysctls0"),
             "test/testdata/baseline/v1.37/fail/capabilities_baseline0.yaml": FIXTURE.format(name="caps0"),
         })
-        self.upstream.release("38.0-alpha.1", days_ago=2)
-        analysis = self.analyze("kubernetes-1.38.0-alpha.1", "kubernetes-1.37.0")
-        self.assertFalse(analysis.relevant)
-        self.assertEqual(analysis.copied, 2)
-        self.assertEqual(analysis.new_versions, ["baseline/v1.37"])
+        self.assertFalse(issue.analysis.relevant)
+        self.assertEqual((issue.analysis.copied, issue.analysis.new_versions), (2, ["baseline/v1.37"]))
 
-    def test_check_change_with_new_fixtures_is_relevant(self):
-        self.upstream.release("37.0-alpha.0", days_ago=3)
-        self.upstream.commit("Add safe sysctls @someone fixes #12", {
+    def test_update_issue(self):
+        issue = self.change({
             "policy/check_sysctls.go": check_sysctls(
-                gates="\t\t\t{MinimumVersion: api.MajorMinorVersion(1, 37), CheckPod: sysctlsV1Dot37},\n",
-                values='\t"net.ipv4.tcp_notsent_lowat",\n\t"net.ipv4.tcp_slow_start_after_idle",\n'),
+                gate=37, values=["net.ipv4.tcp_notsent_lowat", "net.ipv4.tcp_slow_start_after_idle"]),
             "test/testdata/baseline/v1.37/pass/sysctls0.yaml": FIXTURE.format(name="sysctls0"),
             "test/testdata/baseline/v1.37/pass/sysctls1.yaml": FIXTURE.format(name="sysctls1"),
             "test/testdata/baseline/v1.37/fail/capabilities_baseline0.yaml": FIXTURE.format(name="caps0"),
-        })
-        self.upstream.release("37.0-alpha.1", days_ago=2)
-        analysis = self.analyze("kubernetes-1.37.0-alpha.1", "kubernetes-1.37.0-alpha.0")
+        }, message="Add safe sysctls @someone fixes #12", min_kube="1.25")
+        analysis = issue.analysis
         self.assertTrue(analysis.relevant)
         self.assertEqual(sorted(analysis.groups), ["sysctls"])
-        kinds = sorted(c["kind"] for c in analysis.groups["sysctls"])
-        self.assertEqual(kinds, ["check", "fixture"])
+        self.assertEqual(sorted(c["kind"] for c in analysis.groups["sysctls"]), ["check", "fixture"])
         self.assertEqual(analysis.copied, 2)
         self.assertEqual(analysis.signals["sysctls"]["gates"], ["1.37"])
         self.assertEqual(analysis.signals["sysctls"]["added_values"],
@@ -339,155 +386,225 @@ class AnalyzeTest(Base):
         self.assertEqual(analysis.commits[0][2], K8S_SHA)
         self.assertEqual((analysis.unmapped_checks, analysis.stale_checks), ([], []))
 
-        mapped, uncertain, confirm = psa.map_changes(analysis, CONFIG, self.chart)
-        entry = mapped[0]
+        entry = issue.mapped[0]
         self.assertEqual(entry["policy"], "restrict-sysctls")
         # tcp_notsent_lowat and the 1.37 gate are already in the helper.
         self.assertEqual(entry["missing_values"], ["net.ipv4.tcp_slow_start_after_idle"])
         self.assertEqual(entry["missing_gates"], [])
         self.assertFalse(entry["handled"])
-        self.assertEqual((uncertain, confirm), ([], []))
+        self.assertEqual((issue.uncertain, issue.kind), ([], "update"))
 
-        title, body = psa.render_issue(analysis, mapped, uncertain, confirm,
-                                       "https://github.com/kubernetes/pod-security-admission")
-        self.assertEqual(title, "Pod Security Admission v1.37.0-alpha.1: update the PSS CEL policies")
-        for text in [
-            "| `sysctls` | `restrict-sysctls` | baseline |",
-            "version gate `>=1.37`",
-            "- `restrict-sysctls`: template `charts/kyverno-policies/templates/baseline/restrict-sysctls.cel.yaml`; "
-            "helpers `allowedSysctls`; gates `>=1.32`, `>=1.37`; CLI tests `test/cli/test-validating-policy/pss-restrict-sysctls`",
-            "- [ ] Update `charts/kyverno-policies/templates/baseline/restrict-sysctls.cel.yaml` to match",
-            "  - [ ] Handle `net.ipv4.tcp_slow_start_after_idle`",
-            "- [ ] Each behavior change has a CLI test that passes with `make test-cli`.",
-            "- [ ] `make verify-policies-sysctls` passes.",
-            "https://github.com/kubernetes/kubernetes/tree/v1.37.0-alpha.1/staging/src/k8s.io/pod-security-admission",
-            f"https://github.com/kubernetes/kubernetes/commit/{K8S_SHA}",
-            # Upstream text can't ping people or link Kyverno issues.
-            "`Add safe sysctls @someone fixes #12`",
-            "## Acceptance criteria",
-        ]:
-            self.assertIn(text, body)
-        self.assertNotIn("Manual review needed", body)
-        self.assertTrue(body.endswith(psa.marker(analysis.release)))
+        self.assertEqual(issue.title, "Pod Security Admission v1.38.0: update the PSS CEL policies")
+        self.assertIn("**Recommended action:** Update `restrict-sysctls` to match upstream", issue.sections["Summary"])
+        self.assertAllIn([
+            "| Release | [`v1.38.0`](https://github.com/kubernetes/kubernetes/releases/tag/v1.38.0) |",
+            "| Previous release | [`v1.37.0`](https://github.com/kubernetes/kubernetes/releases/tag/v1.37.0) |",
+            "https://github.com/kubernetes/kubernetes/tree/v1.38.0/staging/src/k8s.io/pod-security-admission",
+            f"| Comparison | [`kubernetes-1.37.0...kubernetes-1.38.0`]({TEST_MIRROR}/compare/kubernetes-1.37.0..."
+            "kubernetes-1.38.0) |",
+        ], issue.sections["Release details"])
+        self.assertIn("  - `sysctls`: version gate `>=1.37`; added `net.ipv4.tcp_notsent_lowat`, "
+                      "`net.ipv4.tcp_slow_start_after_idle`", issue.sections["What changed"])
+        self.assertAllIn([
+            "- `restrict-sysctls` (baseline), mapped from upstream check `sysctls`: needs an update",
+            f"  - Template: `{self.SYSCTLS}`",
+            "  - Check helpers: `allowedSysctls`",
+            "  - Version gates in the template: `>=1.32`, `>=1.37`",
+            f"  - CLI tests: `{self.SYSCTLS_TEST}`",
+            # A name match, so the issue doesn't claim that the version gate matches too.
+            "  - Names already in the template or its helpers: `net.ipv4.tcp_notsent_lowat`. Under which version "
+            "gate isn't checked.",
+            "  - Not in the template or its helpers: `net.ipv4.tcp_slow_start_after_idle`",
+        ], issue.sections["Kyverno impact"])
+        actions = issue.sections["Required actions"]
+        self.assertAllIn([f"- [ ] Update `{self.SYSCTLS}` for the upstream `sysctls` change:",
+                          "  - [ ] Handle `net.ipv4.tcp_slow_start_after_idle`",
+                          f"  - [ ] Add or update a CLI test under `{self.SYSCTLS_TEST}`.",
+                          # Without a line for the version, make verify-policies-sysctls wouldn't check the change.
+                          f"  - [ ] Update the expected names in `{psa.SYSCTLS_SCRIPT}`, with a `check v1.37.0` line, "
+                          "so `make verify-policies-sysctls` checks this change."], actions)
+        # Don't ask for work that the template already has.
+        self.assertNotIn("Handle `net.ipv4.tcp_notsent_lowat`", actions)
+        self.assertAllIn([
+            "- [ ] Each upstream `pass` and `fail` fixture in `test/testdata/*/v1.38/` for `sysctls` gets the same "
+            "result from the updated policy. `make verify-policies-sysctls` checks the sysctls allow-list; compare "
+            "any other fixture by hand.",
+            "- [ ] The PSS CLI tests pass with `make test-cli-local-vpols`.",
+            "- [ ] Behavior that starts at Kubernetes `1.37` is gated with `semverCompare`",
+            "- [ ] `make verify-policies-sysctls` passes, and its output lists `v1.37.0`.",
+            "- [ ] `helm template charts/kyverno-policies` renders with `--kube-version v1.25.0` and with "
+            "`--kube-version v1.38.0`.",
+        ], issue.sections["Validation"])
+        self.assertAllIn([f"https://github.com/kubernetes/kubernetes/commit/{K8S_SHA}",
+                          # Upstream text can't ping people or link Kyverno issues.
+                          "`Add safe sysctls @someone fixes #12`"], issue.sections["Upstream evidence"])
 
-    def test_handled_change_asks_for_confirmation_without_the_manual_label(self):
-        self.upstream.release("37.0-alpha.0", days_ago=3)
-        self.upstream.commit("Add a safe sysctl", {"policy/check_sysctls.go": check_sysctls(
-            gates="\t\t\t{MinimumVersion: api.MajorMinorVersion(1, 37), CheckPod: sysctlsV1Dot37},\n",
-            values='\t"net.ipv4.tcp_notsent_lowat",\n')})
-        self.upstream.release("37.0-alpha.1", days_ago=2)
-        analysis = self.analyze("kubernetes-1.37.0-alpha.1", "kubernetes-1.37.0-alpha.0")
-        mapped, uncertain, confirm = psa.map_changes(analysis, CONFIG, self.chart)
-        self.assertTrue(mapped[0]["handled"])
-        self.assertEqual(uncertain, [])
-        self.assertIn("may already handle this change", confirm[0])
-        title, body = psa.render_issue(analysis, mapped, uncertain, confirm, "https://example.com/psa")
-        self.assertIn("confirm the PSS CEL policies need no change", title)
-        self.assertIn("- [ ] Confirm that `charts/kyverno-policies/templates/baseline/restrict-sysctls.cel.yaml` "
-                      "already matches", body)
-        # A handled change with a CLI test asks to confirm the test, not to write one.
-        self.assertIn("  - [ ] Confirm that a CLI test under `test/cli/test-validating-policy/pss-restrict-sysctls` "
-                      "covers the change.", body)
-        self.assertNotIn("Add or update a CLI test", body)
+    def test_handled_change_is_a_confirm_issue(self):
+        issue = self.change({"policy/check_sysctls.go": check_sysctls(gate=37, values=["net.ipv4.tcp_notsent_lowat"])})
+        self.assertTrue(issue.mapped[0]["handled"])
+        self.assertEqual((issue.uncertain, issue.kind), ([], "confirm"))
+        self.assertIn("because the templates already seem to handle the upstream changes to `sysctls`,",
+                      issue.sections["Summary"])
+        # The "already handled" result is an inference, and the issue says so once.
+        impact = issue.sections["Kyverno impact"]
+        self.assertIn("mapped from upstream check `sysctls`: may already handle the change. This is an inference:",
+                      impact)
+        self.assertEqual(impact.count("may already handle"), 1)
+        self.assertIn(f"- [ ] Confirm that `{self.SYSCTLS}` already matches the upstream `sysctls` change, and that "
+                      f"`{self.SYSCTLS_TEST}` covers it.", issue.sections["Required actions"])
+        # Checks that the template matches upstream, and no policy work.
+        self.assertAllIn(["- [ ] Each upstream `pass` and `fail` fixture in `test/testdata/*/v1.38/` for `sysctls` "
+                          "gets the same result from `restrict-sysctls`.",
+                          "- [ ] `make verify-policies-sysctls` passes, and its output lists `v1.37.0`."],
+                         issue.sections["Validation"])
+        for text in self.IMPLEMENTATION:
+            self.assertNotIn(text, issue.body)
 
         # A value that upstream removed but the template still has means it isn't handled.
-        self.upstream.commit("Drop a sysctl", {"policy/check_sysctls.go": check_sysctls(
-            gates="\t\t\t{MinimumVersion: api.MajorMinorVersion(1, 37), CheckPod: sysctlsV1Dot37},\n",
-            values='\t"net.ipv4.tcp_notsent_lowat",\n').replace('\t"kernel.shm_rmid_forced",\n', "")})
-        self.upstream.release("37.0-alpha.2", days_ago=1)
-        analysis = self.analyze("kubernetes-1.37.0-alpha.2", "kubernetes-1.37.0-alpha.0")
-        mapped, uncertain, confirm = psa.map_changes(analysis, CONFIG, self.chart)
-        self.assertEqual(analysis.signals["sysctls"]["removed_values"], ["kernel.shm_rmid_forced"])
-        self.assertFalse(mapped[0]["handled"])
-        self.assertEqual(psa.issue_kind(mapped, uncertain), "update")
-        _, body = psa.render_issue(analysis, mapped, uncertain, confirm, "https://example.com/psa")
-        self.assertIn("  - Already in the template or its helpers: `net.ipv4.tcp_notsent_lowat`, `>=1.37`.", body)
-        self.assertIn("  - [ ] Check whether the removed values must stay allowed", body)
+        self.upstream.release("39.0", files={"policy/check_sysctls.go": check_sysctls(
+            gate=37, values=["net.ipv4.tcp_notsent_lowat"]).replace('\t"kernel.shm_rmid_forced",\n', "")})
+        issue = self.issue("kubernetes-1.39.0", "kubernetes-1.37.0")
+        self.assertEqual(issue.analysis.signals["sysctls"]["removed_values"], ["kernel.shm_rmid_forced"])
+        self.assertFalse(issue.mapped[0]["handled"])
+        self.assertEqual(issue.kind, "update")
+        self.assertAllIn(["  - Names already in the template or its helpers: `net.ipv4.tcp_notsent_lowat`.",
+                          "  - Removed upstream, but still in the template: `kernel.shm_rmid_forced`"],
+                         issue.sections["Kyverno impact"])
+        self.assertIn("  - [ ] Decide whether `kernel.shm_rmid_forced`, which upstream removed, must stay",
+                      issue.sections["Required actions"])
 
-    def test_check_change_without_signals_says_to_read_the_comparison(self):
-        self.upstream.release("37.0-alpha.0", days_ago=3)
-        self.upstream.commit("Refactor sysctls", {"policy/check_sysctls.go": check_sysctls() + "\nfunc helper() {}\n"})
-        self.upstream.release("37.0-alpha.1", days_ago=2)
-        analysis = self.analyze("kubernetes-1.37.0-alpha.1", "kubernetes-1.37.0-alpha.0")
-        mapped, uncertain, confirm = psa.map_changes(analysis, CONFIG, self.chart)
-        self.assertTrue(mapped[0]["no_signals"])
-        self.assertIn("shows no version gate or value change", confirm[0])
-        # A mapped code change still needs an update, so it isn't confirm-only.
-        self.assertEqual(psa.issue_kind(mapped, uncertain), "update")
-        _, body = psa.render_issue(analysis, mapped, uncertain, confirm, "https://example.com/psa")
-        self.assertIn("no gate or value change found: read the comparison", body)
+    def test_a_confirm_issue_gives_every_reason(self):
+        # Like upstream 1.37: a handled check change and test-only changes in one release.
+        issue = self.change({"policy/check_sysctls.go": check_sysctls(gate=37, values=["net.ipv4.tcp_notsent_lowat"]),
+                             "test/run.go": "package test // v2\n"})
+        self.assertEqual(issue.kind, "confirm")
+        self.assertIn("because the templates already seem to handle the upstream changes to `sysctls` and only test "
+                      "code changed for `test-framework`,", issue.sections["Summary"])
+        self.assertAllIn(["- [ ] Confirm that `", "- [ ] Read the upstream test changes for `test-framework`"],
+                         issue.sections["Required actions"])
+
+    def test_check_change_without_signals_needs_manual_review_not_an_update(self):
+        issue = self.change({"policy/check_sysctls.go": check_sysctls() + "\nfunc helper() {}\n"})
+        self.assertTrue(issue.mapped[0]["no_signals"])
+        # A code diff alone isn't a confirmed behavior change.
+        self.assertEqual(issue.kind, "manual")
+        self.assertIn("(manual review)", issue.title)
+        self.assertIn("  - `sysctls`: no version gate or value change found", issue.sections["What changed"])
+        impact = issue.sections["Kyverno impact"]
+        self.assertIn("mapped from upstream check `sysctls`: impact unknown, see **Not mapped**", impact)
+        self.assertIn("- `sysctls`: The check code changed, but the diff shows no version gate or value change, so "
+                      "the automation can't tell whether behavior changed.", impact)
+        self.assertIn("- [ ] Read the `sysctls` code changes in the comparison, and decide whether `restrict-sysctls` "
+                      "needs an update.", issue.sections["Required actions"])
+        self.assertNotIn("- [ ] Update `", issue.body)
 
     def test_new_gate_asks_for_a_semver_gate(self):
-        self.upstream.release("39.0-alpha.0", days_ago=3)
-        self.upstream.commit("Gate sysctls", {"policy/check_sysctls.go": check_sysctls(
-            gates="\t\t\t{MinimumVersion: api.MajorMinorVersion(1, 39), CheckPod: sysctlsV1Dot39},\n", values="")})
-        self.upstream.release("39.0-alpha.1", days_ago=2)
-        analysis = self.analyze("kubernetes-1.39.0-alpha.1", "kubernetes-1.39.0-alpha.0")
-        mapped, uncertain, confirm = psa.map_changes(analysis, CONFIG, self.chart)
-        self.assertEqual(mapped[0]["missing_gates"], ["1.39"])
-        _, body = psa.render_issue(analysis, mapped, uncertain, confirm, "https://example.com/psa")
-        self.assertIn('  - [ ] Add a `semverCompare ">=1.39.0-0"` gate', body)
-        # Only sysctls has a dedicated make target.
-        self.assertIn("`make verify-policies-sysctls` passes", body)
+        issue = self.change({"policy/check_sysctls.go": check_sysctls(gate=39)})
+        self.assertEqual(issue.mapped[0]["missing_gates"], ["1.39"])
+        self.assertIn('  - [ ] Gate the change with `semverCompare ">=1.39.0-0"`, because upstream changes behavior '
+                      'from 1.39.', issue.sections["Required actions"])
+        self.assertIn("Behavior that starts at Kubernetes `1.39` is gated", issue.sections["Validation"])
+        # The sysctls script must check the version where upstream gates the change.
+        self.assertIn(f"  - [ ] Update the expected names in `{psa.SYSCTLS_SCRIPT}`, with a `check v1.39.0` line",
+                      issue.sections["Required actions"])
+        self.assertIn("- [ ] `make verify-policies-sysctls` passes, and its output lists `v1.39.0`.",
+                      issue.sections["Validation"])
+        # Without the chart's minimum version, the issue doesn't make one up.
+        self.assertIn("renders with the oldest Kubernetes version the chart supports", issue.sections["Validation"])
 
-    def test_shared_api_and_new_checks_need_manual_review(self):
-        self.upstream.release("37.0-alpha.0", days_ago=3)
-        self.upstream.commit("Change shared code", {
+    def test_manual_review_issue(self):
+        issue = self.change({
             "policy/helpers.go": "package policy // changed\n",
             "api/helpers.go": "package api // changed\n",
             "policy/check_newThing.go": 'package policy\n\nfunc CheckNewThing() Check { return Check{ID: "newThing"} }\n',
         })
-        self.upstream.release("37.0-alpha.1", days_ago=2)
-        analysis = self.analyze("kubernetes-1.37.0-alpha.1", "kubernetes-1.37.0-alpha.0")
-        self.assertEqual(sorted(analysis.groups), ["api", "newThing", "shared"])
-        self.assertEqual(analysis.unmapped_checks, ["newThing"])
-        mapped, uncertain, confirm = psa.map_changes(analysis, CONFIG, self.chart)
-        # One note per cause: shared, api, and the new check (reported once).
-        self.assertEqual(len(uncertain), 3)
-        self.assertEqual(sum("newThing" in note for note in uncertain), 1)
-        title, body = psa.render_issue(analysis, mapped, uncertain, confirm, "https://example.com/psa")
-        self.assertIn("(manual review)", title)
-        self.assertIn("| `newThing` | none (uncertain) |", body)
-        self.assertIn("| shared | all (uncertain) |", body)
-        self.assertIn("- [ ] Add each new check to `checks` in `scripts/psa-release-issues.yaml`.", body)
+        self.assertEqual(sorted(issue.analysis.groups), ["api", "newThing", "shared"])
+        self.assertEqual(issue.analysis.unmapped_checks, ["newThing"])
+        # One item per cause: the new check (reported once), api, and shared.
+        self.assertEqual([u["subject"] for u in issue.uncertain], ["newThing", "api", "shared"])
+        self.assertEqual(issue.kind, "manual")
+        self.assertIn("(manual review)", issue.title)
+        self.assertIn("**Recommended action:** Resolve the 3 items under **Not mapped**", issue.sections["Summary"])
+        impact = issue.sections["Kyverno impact"]
+        self.assertAllIn(["- `newThing`: Upstream declares this check, but `checks`",
+                          "- `api/`: Changes in `api/` can affect every check",
+                          "- shared `policy/` code: Changes in shared `policy/` code or base fixtures"], impact)
+        # Nothing maps to a template, so the impact lists none.
+        self.assertNotIn("Template:", impact)
+        self.assertAllIn(["- [ ] Map `newThing` to a policy in `checks`",
+                          "- [ ] Read the `api/` changes in the comparison, and decide which of the 4 PSS CEL",
+                          "- [ ] Read the shared `policy/` code and base fixture changes"],
+                         issue.sections["Required actions"])
+        self.assertAllIn(["- [ ] Each item under **Not mapped** is resolved",
+                          "- [ ] After you change `checks`, `python3 scripts/test-psa-release-issues.py` passes.",
+                          "If the review leads to a policy change"], issue.sections["Validation"])
+        self.assertNotIn("- [ ] Update `", issue.body)
+
+    def test_mapped_and_unmapped_changes_are_reported_without_contradiction(self):
+        issue = self.change({"policy/check_sysctls.go": check_sysctls(values=["net.ipv4.new_value"]),
+                             "policy/helpers.go": "package policy // changed\n"})
+        impact = issue.sections["Kyverno impact"]
+        # The mapped policy keeps its files and update, and the unmapped change is listed apart.
+        self.assertIn(f"  - Template: `{self.SYSCTLS}`", impact)
+        self.assertIn("- shared `policy/` code: Changes in shared `policy/` code", impact)
+        self.assertEqual(issue.kind, "manual")
+        self.assertAllIn(["- [ ] Update `", "  - [ ] Handle `net.ipv4.new_value`"], issue.sections["Required actions"])
+        self.assertIn("- [ ] The PSS CLI tests pass with `make test-cli-local-vpols`.", issue.sections["Validation"])
+        self.assertNotIn("If the review leads to a policy change", issue.sections["Validation"])
 
     def test_stale_mapping_and_renamed_check_need_manual_review(self):
-        self.upstream.release("37.0-alpha.0", days_ago=3)
+        self.upstream.release("37.0", days_ago=3)
         self.upstream.run("mv", "policy/check_sysctls.go", "policy/check_sysctls_baseline.go")
         self.upstream.commit("Split sysctls")
-        self.upstream.release("37.0-alpha.1", days_ago=2)
-        config = dict(CONFIG, checks=dict(CONFIG["checks"], oldCheck="disallow-host-path"))
-        analysis = self.analyze("kubernetes-1.37.0-alpha.1", "kubernetes-1.37.0-alpha.0", config["checks"])
-        self.assertEqual(analysis.stale_checks, ["oldCheck"])
-        mapped, uncertain, _ = psa.map_changes(analysis, config, self.chart)
-        self.assertTrue(any("`oldCheck`, which upstream no longer declares" in note for note in uncertain))
-        self.assertTrue(any("renamed or split" in note for note in uncertain))
-        _, body = psa.render_issue(analysis, mapped, uncertain, [], "https://example.com/psa")
-        self.assertIn("- [ ] Remove or rename the stale entries in `checks`", body)
+        self.upstream.release("38.0", days_ago=2)
+        issue = self.issue(config=dict(CONFIG, checks=dict(CONFIG["checks"], oldCheck="disallow-host-path")))
+        self.assertEqual(issue.analysis.stale_checks, ["oldCheck"])
+        problems = "\n".join(u["problem"] for u in issue.uncertain)
+        self.assertIn("upstream no longer declares it", problems)
+        self.assertIn("renamed or split", problems)
+        self.assertAllIn(["- [ ] Find what replaced `oldCheck` upstream",
+                          "- [ ] Confirm that `sysctls` still maps to `restrict-sysctls`"],
+                         issue.sections["Required actions"])
 
     def test_mapped_policy_without_template_needs_manual_review(self):
-        self.upstream.release("37.0-alpha.0", days_ago=3)
-        self.upstream.commit("Change caps", {"policy/check_capabilities_baseline.go": CHECK_CAPS + "// v2\n"})
-        self.upstream.release("37.0-alpha.1", days_ago=2)
-        analysis = self.analyze("kubernetes-1.37.0-alpha.1", "kubernetes-1.37.0-alpha.0")
-        mapping = dict(CONFIG, checks=dict(CONFIG["checks"], capabilities_baseline="gone-policy"))
-        _, uncertain, _ = psa.map_changes(analysis, mapping, self.chart)
-        self.assertIn("no `gone-policy.cel.yaml` template exists", uncertain[0])
+        issue = self.change({"policy/check_capabilities_baseline.go": CHECK_CAPS + "// v2\n"},
+                            config=dict(CONFIG, checks=dict(CONFIG["checks"], capabilities_baseline="gone-policy")))
+        self.assertIn("no `gone-policy.cel.yaml` template exists", issue.uncertain[0]["problem"])
+        # Missing mapping data never shows as a mapped file.
+        self.assertNotIn("Template:", issue.sections["Kyverno impact"])
+        self.assertIn("- [ ] Fix the policy name for `capabilities_baseline` in `checks`, or restore the template.",
+                      issue.sections["Required actions"])
 
     def test_upstream_code_stays_out_of_the_issue_and_files_link_to_the_comparison(self):
-        self.upstream.release("37.0-alpha.0", days_ago=3)
-        self.upstream.commit("Doc", {"policy/check_sysctls.go": check_sysctls() + "\n// ```\n// @someone\n"})
-        self.upstream.release("37.0-alpha.1", days_ago=2)
-        analysis = self.analyze("kubernetes-1.37.0-alpha.1", "kubernetes-1.37.0-alpha.0")
-        mapped, uncertain, confirm = psa.map_changes(analysis, CONFIG, self.chart)
-        _, body = psa.render_issue(analysis, mapped, uncertain, confirm, "https://example.com/psa")
+        issue = self.change({"policy/check_sysctls.go": check_sysctls() + "\n// ```\n// @someone\n"})
         # No diff in the body, so upstream code can't break the Markdown or ping anyone.
-        self.assertNotIn("@someone", body)
-        self.assertNotIn("```", body)
-        compare = "https://example.com/psa/compare/kubernetes-1.37.0-alpha.0...kubernetes-1.37.0-alpha.1"
+        self.assertNotIn("@someone", issue.body)
+        self.assertNotIn("```", issue.body)
+        compare = f"{TEST_MIRROR}/compare/kubernetes-1.37.0...kubernetes-1.38.0"
         anchor = hashlib.sha256(b"policy/check_sysctls.go").hexdigest()
-        self.assertIn(f"[`policy/check_sysctls.go`]({compare}#diff-{anchor}) (M)", body)
-        self.assertIn(f"See the [full comparison]({compare}).", body)
+        self.assertAllIn([f"- **Code:** [`policy/check_sysctls.go`]({compare}#diff-{anchor}) (M)",
+                          f"See the [full comparison]({compare})."], issue.sections["Upstream evidence"])
+
+    def test_a_test_mirror_is_marked_and_the_upstream_mirror_is_not(self):
+        self.upstream.release("37.0", days_ago=3)
+        self.upstream.release("38.0", days_ago=2, files={"policy/check_sysctls.go": check_sysctls(gate=39)})
+        test = self.issue()
+        self.assertIn(f"> This issue was generated from `{TEST_MIRROR}`, not `kubernetes/pod-security-admission`.",
+                      test.sections["Summary"])
+        real = self.issue(repository=psa.DEFAULT_REPOSITORY)
+        for text in ["[!NOTE]", "example.com", "test release"]:
+            self.assertNotIn(text, real.body)
+        self.assertIn(f"({psa.DEFAULT_REPOSITORY}/compare/kubernetes-1.37.0...kubernetes-1.38.0)",
+                      real.sections["Release details"])
+
+    def test_published_time_is_utc(self):
+        self.upstream.release("37.0", days_ago=3)
+        self.upstream.release("38.0", days_ago=2, files={"policy/check_sysctls.go": check_sysctls(gate=39)})
+        self.assertRegex(self.issue().sections["Release details"],
+                         r"\| Published \| \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC \|")
+        india = timezone(timedelta(hours=5, minutes=30))
+        self.assertEqual(psa.utc(datetime(2026, 8, 26, 16, 14, tzinfo=india)), "2026-08-26 10:44 UTC")
+        self.assertEqual(psa.utc(None), "unknown")
 
 
 class FakeGitHub(psa.GitHub):
@@ -546,47 +663,47 @@ class FakeGitHub(psa.GitHub):
 class RunTest(Base):
     """Runs the whole check against the local mirror and a fake GitHub."""
 
-    ALPHA1_TITLE = "Pod Security Admission v1.37.0-alpha.1: update the PSS CEL policies"
+    V38_TITLE = "Pod Security Admission v1.38.0: update the PSS CEL policies"
 
     def setUp(self):
         super().setUp()
         self.upstream.release("36.0", days_ago=40)
-        # The baseline. Everything after it is checked, however old.
-        self.upstream.release("37.0-alpha.0", days_ago=30)
-        self.upstream.commit("Add a safe sysctl", {"policy/check_sysctls.go": check_sysctls(
-            gates="", values='\t"net.ipv4.tcp_slow_start_after_idle",\n')})
-        self.upstream.release("37.0-alpha.1", days_ago=20)
+        # The baseline. Every minor after it is checked, however old.
+        self.upstream.release("37.0", days_ago=30)
+        # A pre-release and a patch that both carry the sysctl change are skipped.
+        self.upstream.release("38.0-alpha.1", days_ago=25, files={
+            "policy/check_sysctls.go": check_sysctls(values=["net.ipv4.tcp_slow_start_after_idle"])})
+        self.upstream.release("38.0", days_ago=20)
+        self.upstream.release("37.1", days_ago=10, branch_from="kubernetes-1.38.0-alpha.1")
         self.upstream.release("36.1", days_ago=10, branch_from="kubernetes-1.36.0")
 
     def run_tool(self, github, **overrides):
-        args = argparse.Namespace(repository=str(self.upstream.path), since="kubernetes-1.37.0-alpha.0",
-                                  include_prereleases=True, tag=None, dry_run=False, out=str(self.dir / "out"))
+        args = argparse.Namespace(repository=str(self.upstream.path), since="kubernetes-1.37.0",
+                                  tag=None, dry_run=False, out=str(self.dir / "out"))
         vars(args).update(overrides)
         Path(args.out).mkdir(exist_ok=True)
         with redirect_stderr(io.StringIO()):
             return psa.run(args, github, self.chart, CONFIG)
 
-    def test_checks_every_release_after_the_baseline(self):
+    def test_checks_only_minor_releases_after_the_baseline(self):
         github = FakeGitHub()
         summary, failures = self.run_tool(github)
         self.assertEqual(failures, [])
-        # alpha.1 is 20 days old: no time window can miss it.
-        self.assertEqual([i["title"] for i in github.created()], [self.ALPHA1_TITLE])
+        # v1.38.0 is 20 days old: no time window can miss it.
+        self.assertEqual([i["title"] for i in github.created()], [self.V38_TITLE])
         self.assertEqual(github.created()[0]["labels"], ["psa-cel-update", "area/pss"])
         self.assertEqual(github.labels, {"psa-cel-update", "area%2Fpss"})
         self.assertEqual(summary, [
-            "- `v1.36.1` (since `v1.36.0`): no action needed: no change in `policy/`, `api/`, or `test/`",
-            "- `v1.37.0-alpha.1` (since `v1.37.0-alpha.0`): opened [#1](https://github.com/owner/kyverno/issues/1)",
+            "- `v1.38.0` (since `v1.37.0`): opened [#1](https://github.com/owner/kyverno/issues/1)",
         ])
 
     def test_release_selection(self):
         github = FakeGitHub()
-        # A later baseline, or skipping pre-releases, leaves only v1.36.1, which needs no action.
-        for overrides in ({"since": "kubernetes-1.37.0-alpha.1"}, {"include_prereleases": False}):
-            summary, _ = self.run_tool(github, **overrides)
-            self.assertEqual((github.created(), len(summary)), ([], 1), overrides)
+        # A later baseline leaves nothing to check.
+        summary, _ = self.run_tool(github, since="kubernetes-1.38.0")
+        self.assertEqual((github.created(), summary), ([], []))
         # --tag checks one release, whatever the baseline.
-        self.run_tool(github, tag="kubernetes-1.37.0-alpha.1", since="kubernetes-1.37.0-alpha.1")
+        self.run_tool(github, tag="kubernetes-1.38.0", since="kubernetes-1.38.0")
         self.assertEqual(len(github.created()), 1)
         with self.assertRaisesRegex(psa.ReleaseError, "baseline tag kubernetes-1.99.0 isn't in"):
             self.run_tool(github, since="kubernetes-1.99.0")
@@ -594,11 +711,11 @@ class RunTest(Base):
             self.run_tool(github, tag="kubernetes-1.99.0")
 
     def test_an_open_or_closed_issue_or_a_rerun_never_duplicates(self):
-        marker = psa.marker(psa.Release("kubernetes-1.37.0-alpha.1"))
+        marker = psa.marker(psa.Release("kubernetes-1.38.0"))
         github = FakeGitHub(bodies=[f"Closed earlier.\n{marker}"])
         summary, _ = self.run_tool(github)
         self.assertEqual(github.created(), [])
-        self.assertIn("- `v1.37.0-alpha.1`: issue already exists (#1)", summary)
+        self.assertIn("- `v1.38.0`: issue already exists (#1)", summary)
         github = FakeGitHub()
         for _ in range(3):
             self.run_tool(github)
@@ -613,15 +730,14 @@ class RunTest(Base):
             calls.append(1)
             # Another run opens the issue after this run's first listing.
             if len(calls) == 2:
-                github.add(f"Opened elsewhere.\n{psa.marker(psa.Release('kubernetes-1.37.0-alpha.1'))}")
+                github.add(f"Opened elsewhere.\n{psa.marker(psa.Release('kubernetes-1.38.0'))}")
             return real_issues()
 
         github.issues = issues
         summary, failures = self.run_tool(github)
         self.assertEqual(failures, [])
         self.assertEqual(github.created(), [])
-        self.assertIn("- `v1.37.0-alpha.1` (since `v1.37.0-alpha.0`): issue #1 (opened by another run meanwhile)",
-                      summary)
+        self.assertIn("- `v1.38.0` (since `v1.37.0`): issue #1 (opened by another run meanwhile)", summary)
 
     def test_a_concurrent_create_closes_the_later_issue(self):
         def race(fake, body):
@@ -644,49 +760,46 @@ class RunTest(Base):
             with self.assertRaisesRegex(psa.ReleaseError, "Issues are turned off in owner/kyverno"):
                 self.run_tool(github, dry_run=dry_run)
             self.assertEqual([(m, p) for m, p, _ in github.calls], [("GET", "repos/owner/kyverno")])
-            self.assertFalse((self.dir / "out/kubernetes-1.37.0-alpha.1.md").exists())
+            self.assertFalse((self.dir / "out/kubernetes-1.38.0.md").exists())
 
     def test_dry_run_writes_the_issue_and_changes_nothing(self):
         github = FakeGitHub()
         summary, _ = self.run_tool(github, dry_run=True)
         # Only reads: the repository settings and the issue list.
         self.assertEqual([m for m, _, _ in github.calls], ["GET", "GET"])
-        body = (self.dir / "out/kubernetes-1.37.0-alpha.1.md").read_text(encoding="utf-8")
+        body = (self.dir / "out/kubernetes-1.38.0.md").read_text(encoding="utf-8")
         self.assertIn("net.ipv4.tcp_slow_start_after_idle", body)
-        self.assertIn("- `v1.37.0-alpha.1` (since `v1.37.0-alpha.0`): would open an issue (dry run, see "
-                      "kubernetes-1.37.0-alpha.1.md)", summary)
+        self.assertIn("- `v1.38.0` (since `v1.37.0`): would open an issue (dry run, see kubernetes-1.38.0.md)",
+                      summary)
 
-    def test_a_release_without_a_previous_one_fails_loudly(self):
-        self.upstream.release("40.0-alpha.0", days_ago=1)
+    def test_a_release_without_the_previous_minor_fails_loudly(self):
+        self.upstream.release("40.0", days_ago=1)
         github = FakeGitHub()
         summary, failures = self.run_tool(github)
-        self.assertEqual(failures, ["kubernetes-1.40.0-alpha.0"])
-        self.assertIn("- `v1.40.0-alpha.0`: **error**: no previous release to compare with; check this release by hand",
+        self.assertEqual(failures, ["kubernetes-1.40.0"])
+        self.assertIn("- `v1.40.0`: **error**: no previous release to compare with; check this release by hand",
                       summary)
 
     def test_labels_follow_the_issue_kind(self):
         # Test-only: an issue to confirm, without the manual-review label.
-        self.upstream.commit("Refactor tests", {"policy/check_sysctls_test.go": "package policy // v2\n"})
-        self.upstream.release("37.0-alpha.2", days_ago=5)
+        self.upstream.release("39.0", days_ago=5, files={"policy/check_sysctls_test.go": "package policy // v2\n"})
         # Shared code: manual review.
-        self.upstream.commit("Change shared code", {"policy/helpers.go": "package policy // changed\n"})
-        self.upstream.release("37.0-alpha.3", days_ago=4)
+        self.upstream.release("40.0", days_ago=4, files={"policy/helpers.go": "package policy // changed\n"})
         github = FakeGitHub()
         summary, failures = self.run_tool(github)
         self.assertEqual(failures, [])
         by_tag = {i["title"].split()[3].rstrip(":"): i for i in github.created()}
-        self.assertEqual(by_tag["v1.37.0-alpha.1"]["labels"], ["psa-cel-update", "area/pss"])
-        self.assertEqual(by_tag["v1.37.0-alpha.2"]["labels"], ["psa-cel-update", "area/pss"])
-        self.assertIn("confirm the PSS CEL policies need no change", by_tag["v1.37.0-alpha.2"]["title"])
-        self.assertEqual(by_tag["v1.37.0-alpha.3"]["labels"], ["psa-cel-update", "area/pss", "needs-manual-review"])
+        self.assertEqual(by_tag["v1.38.0"]["labels"], ["psa-cel-update", "area/pss"])
+        self.assertEqual(by_tag["v1.39.0"]["labels"], ["psa-cel-update", "area/pss"])
+        self.assertIn("confirm the PSS CEL policies need no change", by_tag["v1.39.0"]["title"])
+        self.assertEqual(by_tag["v1.40.0"]["labels"], ["psa-cel-update", "area/pss", "needs-manual-review"])
         self.assertIn("needs-manual-review", github.labels)
-        self.assertTrue(any("alpha.2" in line and "(confirm only)" in line for line in summary))
-        self.assertTrue(any("alpha.3" in line and "(manual review)" in line for line in summary))
+        self.assertTrue(any("v1.39.0" in line and "(confirm only)" in line for line in summary))
+        self.assertTrue(any("v1.40.0" in line and "(manual review)" in line for line in summary))
 
     def test_failed_create_is_reported_and_the_rest_continue(self):
-        self.upstream.commit("Another sysctl", {"policy/check_sysctls.go": check_sysctls(
-            gates="", values='\t"net.ipv4.tcp_slow_start_after_idle",\n\t"net.ipv4.other",\n')})
-        self.upstream.release("37.0-alpha.2", days_ago=5)
+        self.upstream.release("39.0", days_ago=5, files={"policy/check_sysctls.go": check_sysctls(
+            values=["net.ipv4.tcp_slow_start_after_idle", "net.ipv4.other"])})
         calls = []
 
         def fail_first(fake, body):
@@ -696,9 +809,9 @@ class RunTest(Base):
 
         github = FakeGitHub(on_create=fail_first)
         summary, failures = self.run_tool(github)
-        self.assertEqual(failures, ["kubernetes-1.37.0-alpha.1"])
+        self.assertEqual(failures, ["kubernetes-1.38.0"])
         self.assertEqual([i["title"] for i in github.created()],
-                         ["Pod Security Admission v1.37.0-alpha.2: update the PSS CEL policies"])
+                         ["Pod Security Admission v1.39.0: update the PSS CEL policies"])
         self.assertTrue(any("**error**: gh api POST" in line and "HTTP 502" in line for line in summary))
         # The next run retries the failed release.
         github.on_create = None
@@ -709,7 +822,7 @@ class RunTest(Base):
     def test_failed_label_creation_fails_the_release(self):
         github = FakeGitHub(fail={("POST", "/labels"): "HTTP 403: Resource not accessible by integration"})
         summary, failures = self.run_tool(github)
-        self.assertEqual(failures, ["kubernetes-1.37.0-alpha.1"])
+        self.assertEqual(failures, ["kubernetes-1.38.0"])
         self.assertEqual(github.created(), [])
         self.assertTrue(any("HTTP 403" in line for line in summary))
 
@@ -720,10 +833,9 @@ class RunTest(Base):
         self.assertEqual(github.created(), [])
 
     def test_caps_issues_per_run(self):
-        for n in range(2, 2 + psa.MAX_ISSUES_PER_RUN):
-            self.upstream.commit(f"Sysctl {n}", {"policy/check_sysctls.go": check_sysctls(
-                gates="", values=f'\t"net.ipv4.value{n}",\n')})
-            self.upstream.release(f"37.0-alpha.{n}", days_ago=5)
+        for minor in range(39, 39 + psa.MAX_ISSUES_PER_RUN):
+            self.upstream.release(f"{minor}.0", days_ago=5,
+                                  files={"policy/check_sysctls.go": check_sysctls(values=[f"net.ipv4.value{minor}"])})
         github = FakeGitHub()
         summary, _ = self.run_tool(github)
         self.assertEqual(len(github.created()), psa.MAX_ISSUES_PER_RUN)
@@ -858,6 +970,8 @@ class WorkflowTest(unittest.TestCase):
     def test_safe_defaults(self):
         inputs = self.on["workflow_dispatch"]["inputs"]
         self.assertIs(inputs["dry-run"]["default"], True)
+        # Quarterly: minor releases come out about every 4 months.
+        self.assertEqual(self.on["schedule"], [{"cron": "23 6 1 1,4,7,10 *"}])
         check = self.jobs["check"]
         # Scheduled runs are opt-in, and only the default branch opens issues.
         self.assertIn("vars.PSA_CEL_UPDATE_ISSUES == 'true'", check["if"])
@@ -897,15 +1011,19 @@ class MainTest(unittest.TestCase):
         chart = psa.Chart(ROOT)
         missing = [p for p in config["checks"].values() if not chart.lookup(p)]
         self.assertEqual(missing, [])
+        # The Helm validation step names the chart's real minimum version.
+        self.assertRegex(chart.min_kube or "", r"^1\.\d+$")
 
     def test_rejects_an_invalid_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.yaml"
             for text, error in [
-                ("since: v0.37.1\nchecks: {sysctls: restrict-sysctls}\n", "since must be"),
-                ("since: kubernetes-1.37.1\n", "checks must be a non-empty map"),
-                ("since: kubernetes-1.37.1\nchecks: {sysctls: ''}\n", "must map to a policy name"),
-                ("since: kubernetes-1.37.1\nchecks: {sysctls: a, Sysctls: b}\n", "unique ignoring case"),
+                ("since: v0.37.0\nchecks: {sysctls: restrict-sysctls}\n", "since must be"),
+                # Only a minor release can be the baseline.
+                ("since: kubernetes-1.37.1\nchecks: {sysctls: restrict-sysctls}\n", "since must be"),
+                ("since: kubernetes-1.37.0\n", "checks must be a non-empty map"),
+                ("since: kubernetes-1.37.0\nchecks: {sysctls: ''}\n", "must map to a policy name"),
+                ("since: kubernetes-1.37.0\nchecks: {sysctls: a, Sysctls: b}\n", "unique ignoring case"),
             ]:
                 path.write_text(text, encoding="utf-8")
                 with self.assertRaisesRegex(psa.ReleaseError, error):
