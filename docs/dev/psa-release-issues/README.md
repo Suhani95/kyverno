@@ -1,7 +1,7 @@
 # PSA release issues
 
 The `PSA release issues` workflow (`.github/workflows/psa-release-issues.yaml`) opens a GitHub issue for each
-Kubernetes Pod Security Admission (PSA) release whose upstream changes the Pod Security Standards (PSS)
+Kubernetes Pod Security Admission (PSA) minor release whose upstream changes the Pod Security Standards (PSS)
 `ValidatingPolicy` templates in `charts/kyverno-policies` may need. The logic is in
 `scripts/psa-release-issues.py`, the baseline and the check-to-policy map are in `scripts/psa-release-issues.yaml`,
 and the tests are in `scripts/test-psa-release-issues.py`.
@@ -14,18 +14,16 @@ each release there as `kubernetes-1.<minor>.<patch>` and `v0.<minor>.<patch>` on
 fetches the `kubernetes-1.*` tags into a blobless clone, and diffs two tags to get the change to the staging
 directory.
 
-GitHub can't start a workflow from a release in another owner's repository, so the workflow polls every 6 hours.
-An issue opens within about 6 hours of a release. GitHub can delay scheduled runs, and disables them in a public
-repository after 60 days without activity.
+GitHub can't start a workflow from a release in another owner's repository, so the workflow runs quarterly, on
+January 1, April 1, July 1, and October 1. Kubernetes ships a minor release about every 4 months, so an issue opens
+1 to 13 weeks after the release. Kyverno doesn't need it sooner: a PSS change ships in a later Kyverno release.
+GitHub can delay scheduled runs, and disables them in a public repository after 60 days without activity; run the
+workflow manually to check sooner.
 
-Each release is compared with the previous relevant release. The trees are compared, not the history, because
-release branches diverge from `master`.
-
-| Release | Compared with |
-|---|---|
-| A patch, such as `v1.37.2` | The previous patch of the same minor, `v1.37.1` |
-| A pre-release, such as `v1.38.0-rc.0` | The previous pre-release of the same minor, or `v1.37.0` for the first one |
-| A new minor, such as `v1.38.0` | Its last pre-release. With `--skip-prereleases`, `v1.37.0`. |
+Only minor releases are checked, and each one is compared with the previous minor: `v1.38.0` with `v1.37.0`.
+Patches and pre-releases, such as `v1.37.2` or `v1.38.0-rc.0`, are skipped. A PSA fix that a patch backports
+also lands in the next minor, so the minor comparison includes it. The trees are compared, not the history,
+because release branches diverge from `master`.
 
 Every change in `policy/`, `api/`, or `test/` needs an issue, except fixtures that a new
 `test/testdata/<level>/v1.<N>/` directory copies unchanged from `v1.<N - 1>`. Only a release with no other change
@@ -70,11 +68,10 @@ rather than pull requests, and no upstream code goes into the issue body.
 
 ### Release tracking and duplicates
 
-The script stores no state. Each run checks every release published after `since`, whatever its age, so a
-failed or skipped run misses nothing. It compares publish dates, so a later patch for an older minor is checked
-too.
+The script stores no state. Each run checks every minor release after `since`, whatever its age, so a failed
+or skipped run misses nothing.
 
-Each issue ends with a hidden marker, such as `<!-- psa-cel-update: kubernetes-1.37.1 -->`, and the script skips
+Each issue ends with a hidden marker, such as `<!-- psa-cel-update: kubernetes-1.38.0 -->`, and the script skips
 each release whose marker is in an open or closed issue with the `psa-cel-update` label. For concurrent runs:
 
 1. The workflow runs one `Check releases` job at a time per repository, for every ref.
@@ -105,9 +102,8 @@ clear message when they're off. Forks have Issues off by default.
    | Input | Default | Description |
    |---|---|---|
    | `dry-run` | `true` | Writes the issues to the job summary and an artifact instead of opening them |
-   | `tag` | none | Checks only this tag, such as `kubernetes-1.37.0-alpha.1` |
-   | `since` | none | Overrides the baseline tag |
-   | `skip-prereleases` | `false` | Skips alpha, beta, and rc releases |
+   | `tag` | none | Checks only this minor release tag, such as `kubernetes-1.38.0` |
+   | `since` | none | Overrides the baseline tag, a `kubernetes-1.<minor>.0` tag |
    | `repository` | none | For testing only: reads releases from this PSA fork, such as `https://github.com/OWNER/pod-security-admission`, instead of `kubernetes/pod-security-admission` |
 
 1. Click **Run workflow**, and read the job summary.
@@ -121,7 +117,7 @@ Only a run of the default branch opens issues.
 1. Check each item under **Acceptance criteria**, such as `make test-cli`.
 1. Close the issue. A closed issue is never reopened or recreated.
 
-To move the baseline, change `since` to a release whose changes the chart already handles. When upstream adds a
+To move the baseline, change `since` to a minor release whose changes the chart already handles. When upstream adds a
 check, add it to `checks`. The tests fail when a mapped policy has no template.
 
 ## Test a change
@@ -143,14 +139,14 @@ Only a real run verifies the workflow. Before you rely on it, in a fork:
 To see the whole path from an upstream change to an issue without touching upstream, point a manual run at a
 fork of `kubernetes/pod-security-admission`. Forks don't copy tags, so you add two test tags:
 
-1. In a clone of your PSA fork, check out a real release commit, such as the `kubernetes-1.38.0-alpha.2` tag
-   from `kubernetes/pod-security-admission`, and tag it `kubernetes-1.99.0-alpha.0`. Version 1.99 never becomes
-   a real release, so the test issue's marker never blocks a real one.
+1. In a clone of your PSA fork, check out a real release commit, such as the `kubernetes-1.38.0` tag from
+   `kubernetes/pod-security-admission`, and tag it `kubernetes-1.98.0`. Versions 1.98 and 1.99 never become real
+   releases, so the test issue's marker never blocks a real one.
 1. Commit a small, clearly labeled change, such as a fake value added to the allowed list in
-   `policy/check_sysctls.go`, and tag it `kubernetes-1.99.0-alpha.1`. Use annotated tags (`git tag -a`).
+   `policy/check_sysctls.go`, and tag it `kubernetes-1.99.0`. Use annotated tags (`git tag -a`).
 1. Push only the two tags to your PSA fork.
 1. In your Kyverno fork, run the workflow with `repository` set to your PSA fork, `tag` set to
-   `kubernetes-1.99.0-alpha.1`, and `dry-run` set. Check the job summary and the issue preview in the artifact.
+   `kubernetes-1.99.0`, and `dry-run` set. Check the job summary and the issue preview in the artifact.
 1. Run it again with `dry-run` cleared to open the test issue, and once more to check that it doesn't open a second
    one.
 1. Clean up: close the test issue, and delete the two tags from your PSA fork.
@@ -167,5 +163,5 @@ python3 scripts/psa-release-issues.py --repo OWNER/NAME --out /tmp/psa-release -
 ```
 
 A dry run writes `summary.md` and one file per issue to `--out`. The script exits with `1` when it can't fetch
-the mirror or handle a release, and the next run retries. It opens at most five issues per run, and a release
-with no previous release to compare with fails the run, so a person checks it.
+the mirror or handle a release, and the next run retries. It opens at most five issues per run, and a minor
+release without the previous minor to compare with fails the run, so a person checks it.

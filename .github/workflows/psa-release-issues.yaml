@@ -2,11 +2,12 @@
 
 name: PSA release issues
 
-# Checks each Kubernetes Pod Security Admission (PSA) release published after
-# the baseline in scripts/psa-release-issues.yaml, and opens one
-# psa-cel-update issue for each release whose upstream changes the PSS CEL
-# policies may need. A change that can't be mapped with confidence also gets
-# the needs-manual-review label. See scripts/psa-release-issues.py and
+# Checks each Kubernetes Pod Security Admission (PSA) minor release after the
+# baseline in scripts/psa-release-issues.yaml against the previous minor, and
+# opens one psa-cel-update issue for each release whose upstream changes the
+# PSS CEL policies may need. Patches and pre-releases are skipped. A change
+# that can't be mapped with confidence also gets the needs-manual-review
+# label. See scripts/psa-release-issues.py and
 # docs/dev/psa-release-issues/README.md.
 #
 # Scheduled runs are off until the repository variable PSA_CEL_UPDATE_ISSUES is
@@ -14,8 +15,8 @@ name: PSA release issues
 
 on:
   schedule:
-    # Every 6 hours, at minute 23.
-    - cron: '23 */6 * * *'
+    # Quarterly, on January, April, July, and October 1 at 06:23 UTC.
+    - cron: '23 6 1 1,4,7,10 *'
   workflow_dispatch:
     inputs:
       dry-run:
@@ -23,17 +24,13 @@ on:
         type: boolean
         default: true
       tag:
-        description: Check only this tag, for example kubernetes-1.37.0-alpha.1
+        description: Check only this minor release tag, for example kubernetes-1.38.0
         type: string
         default: ''
       since:
         description: Override the baseline tag in scripts/psa-release-issues.yaml
         type: string
         default: ''
-      skip-prereleases:
-        description: Skip alpha, beta, and rc releases
-        type: boolean
-        default: false
       repository:
         description: For testing, read releases from this PSA fork, such as https://github.com/OWNER/pod-security-admission
         type: string
@@ -109,7 +106,6 @@ jobs:
           REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag }}
           SINCE: ${{ inputs.since }}
-          SKIP_PRERELEASES: ${{ inputs.skip-prereleases }}
           # Empty, and so kubernetes/pod-security-admission, unless a manual run sets it.
           REPOSITORY: ${{ inputs.repository }}
         run: |
@@ -117,7 +113,6 @@ jobs:
           [ "$DRY_RUN" = "true" ] && args+=(--dry-run)
           [ -n "$TAG" ] && args+=(--tag "$TAG")
           [ -n "$SINCE" ] && args+=(--since "$SINCE")
-          [ "$SKIP_PRERELEASES" = "true" ] && args+=(--skip-prereleases)
           [ -n "$REPOSITORY" ] && args+=(--repository "$REPOSITORY")
           rc=0
           "$PSA_PYTHON" scripts/psa-release-issues.py "${args[@]}" > "$RUNNER_TEMP/psa-release.md" || rc=$?

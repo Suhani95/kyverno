@@ -1,10 +1,10 @@
 # Configuration for scripts/psa-release-issues.py.
 
-# Baseline: every Pod Security Admission release published after this
-# kubernetes-1.* tag is checked on every run, so the PSS CEL policies must
-# already match upstream at this release. Move it forward only to a release
-# whose changes are all handled.
-since: kubernetes-1.37.1
+# Baseline: every Pod Security Admission minor release after this
+# kubernetes-1.<minor>.0 tag is checked on every run, so the PSS CEL policies
+# must already match upstream at this release. Move it forward only to a minor
+# release whose changes are all handled.
+since: kubernetes-1.37.0
 
 # Upstream check ID (the ID in policy/check_*.go) to the PSS policy in
 # charts/kyverno-policies. Fixture names are the lowercased ID plus a number,
