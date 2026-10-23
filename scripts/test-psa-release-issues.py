@@ -198,16 +198,18 @@ class Base(unittest.TestCase):
               min_kube=None):
         """Analyzes, maps, and renders one release. Returns all the results, and the body split into sections."""
         analysis = self.analyze(tag, previous, config["checks"])
-        mapped, uncertain, notes = psa.map_changes(analysis, config, self.chart)
-        title, body = psa.render_issue(analysis, mapped, uncertain, notes, repository, min_kube)
+        mapped, uncertain = psa.map_changes(analysis, config, self.chart)
+        title, body = psa.render_issue(analysis, mapped, uncertain, repository, min_kube)
         parts = re.split(r"^## (.+)$", body, flags=re.MULTILINE)
-        issue = SimpleNamespace(analysis=analysis, mapped=mapped, uncertain=uncertain, notes=notes, title=title,
+        issue = SimpleNamespace(analysis=analysis, mapped=mapped, uncertain=uncertain, title=title,
                                 kind=psa.issue_kind(mapped, uncertain), body=body,
                                 sections=dict(zip(parts[1::2], parts[2::2])))
         # Every issue kind shares the same structure, and never contradicts its own mapping.
         self.assertEqual(list(issue.sections), SECTIONS)
         self.assertIn(f"**Issue type:** {psa.KIND_NAMES[issue.kind]}", issue.sections["Summary"])
         self.assertNotIn("Every change maps", body)
+        # Counts read as "1 fixture" or "3 files", never "file(s)".
+        self.assertNotIn("(s)", body)
         self.assertEqual("**Not mapped.**" in issue.sections["Kyverno impact"], bool(uncertain))
         self.assertTrue(body.endswith(psa.marker(analysis.release)))
         return issue
@@ -288,7 +290,7 @@ class AnalyzeTest(Base):
     SYSCTLS_TEST = f"{psa.CLI_TESTS_DIR}/pss-restrict-sysctls"
     # Text that only an issue asking for policy work may contain.
     IMPLEMENTATION = ["- [ ] Update `", "Handle `", "Add or update a CLI test", "semverCompare", "make test-cli",
-                      "helm template", "verify-policies"]
+                      "helm template", "Update the expected names"]
 
     def test_dependency_only_release_needs_no_action(self):
         issue = self.change()
@@ -307,17 +309,18 @@ class AnalyzeTest(Base):
         self.assertTrue(all(e["test_only"] for e in issue.mapped))
         self.assertEqual((issue.uncertain, issue.kind), ([], "confirm"))
         self.assertEqual(issue.title, "Pod Security Admission v1.38.0: confirm the PSS CEL policies need no change")
-        self.assertIn("because only upstream test code changed", issue.sections["Summary"])
-        self.assertIn("- **Test code:** 3 file(s) for `sysctls`, `test-framework`", issue.sections["What changed"])
+        self.assertIn("because only test code changed for `sysctls`, `test-framework`,", issue.sections["Summary"])
+        self.assertIn("- **Test code:** 3 files for `sysctls`, `test-framework`", issue.sections["What changed"])
         # Test code isn't mapped to a template, and the issue says why without claiming nothing changed.
         impact = issue.sections["Kyverno impact"]
-        self.assertIn("**Test code only:** `sysctls`, `test-framework`.", impact)
+        self.assertIn("**Test code only:** `sysctls`, `test-framework`. The automation found no check code or "
+                      "fixture change for them,", impact)
         self.assertIn("doesn't rule out a behavior change", impact)
         self.assertNotIn("Template:", impact)
         self.assertAllIn(["- [ ] Read the upstream test changes for `sysctls`, `test-framework`",
                           "- [ ] Comment with the outcome"], issue.sections["Required actions"])
         self.assertIn("None, unless the review finds a behavior change.", issue.sections["Validation"])
-        for text in self.IMPLEMENTATION:
+        for text in self.IMPLEMENTATION + ["verify-policies"]:
             self.assertNotIn(text, issue.body)
 
     def test_code_fixtures_and_tests_are_listed_apart_and_criteria_follow_the_changes(self):
@@ -333,19 +336,28 @@ class AnalyzeTest(Base):
         self.assertLess(changed.index("**Code:**"), changed.index("**Fixtures:**"))
         self.assertLess(changed.index("**Fixtures:**"), changed.index("**Test code:**"))
         self.assertAllIn(["  - `sysctls`: version gate `>=1.37`",
-                          "  - `capabilities_baseline`: 1 fixture(s) for `1.36` (baseline)",
-                          "- **Test code:** 3 file(s) for `capabilities_baseline`, `privileged`, `sysctls`"], changed)
+                          "  - `capabilities_baseline`: 1 fixture for `1.36` (baseline)",
+                          "- **Test code:** 3 files for `capabilities_baseline`, `privileged`, `sysctls`"], changed)
         # sysctls already has the 1.37 gate; only the fixture change needs work.
         self.assertEqual(issue.kind, "update")
         self.assertIn("- `disallow-capabilities` (baseline), mapped from upstream check `capabilities_baseline`: "
                       "needs an update", issue.sections["Kyverno impact"])
-        self.assertIn("- [ ] Compare `disallow-capabilities` with the changed upstream fixtures for `1.36`",
-                      issue.sections["Required actions"])
-        # No gate and no sysctls work, so neither criterion appears.
+        self.assertIn("**Test code only:** `privileged`. The automation found no check code or fixture change for "
+                      "it, so it lists no CEL template for it.", issue.sections["Kyverno impact"])
+        actions = issue.sections["Required actions"]
+        self.assertIn("- [ ] Compare `disallow-capabilities` with the changed upstream fixtures for `1.36`", actions)
+        # sysctls is handled: no sysctls work, only its check, and no gate to add.
+        self.assertNotIn(psa.SYSCTLS_SCRIPT, actions)
         validation = issue.sections["Validation"]
-        self.assertIn("- [ ] The PSS CLI tests pass with `make test-cli-local-vpols`.", validation)
+        self.assertAllIn([
+            "- [ ] The PSS CLI tests pass with `make test-cli-local-vpols`.",
+            # No command covers the capabilities fixtures, and the issue says so.
+            "- [ ] Each upstream `pass` and `fail` fixture in `test/testdata/*/v1.38/` for `capabilities_baseline` "
+            "gets the same result from the updated policy. No command runs them against the PSS policies, so compare "
+            "them by hand.",
+            "- [ ] `make verify-policies-sysctls` passes, and its output lists `v1.37.0`.",
+        ], validation)
         self.assertNotIn("semverCompare", validation)
-        self.assertNotIn("verify-policies-sysctls", validation)
 
     def test_copied_fixture_version_needs_no_action(self):
         issue = self.change({
@@ -380,7 +392,7 @@ class AnalyzeTest(Base):
         self.assertEqual(entry["missing_values"], ["net.ipv4.tcp_slow_start_after_idle"])
         self.assertEqual(entry["missing_gates"], [])
         self.assertFalse(entry["handled"])
-        self.assertEqual((issue.uncertain, issue.notes, issue.kind), ([], [], "update"))
+        self.assertEqual((issue.uncertain, issue.kind), ([], "update"))
 
         self.assertEqual(issue.title, "Pod Security Admission v1.38.0: update the PSS CEL policies")
         self.assertIn("**Recommended action:** Update `restrict-sysctls` to match upstream", issue.sections["Summary"])
@@ -399,22 +411,29 @@ class AnalyzeTest(Base):
             "  - Check helpers: `allowedSysctls`",
             "  - Version gates in the template: `>=1.32`, `>=1.37`",
             f"  - CLI tests: `{self.SYSCTLS_TEST}`",
-            "  - Already in the template or its helpers: `net.ipv4.tcp_notsent_lowat`, `>=1.37`",
+            # A name match, so the issue doesn't claim that the version gate matches too.
+            "  - Names already in the template or its helpers: `net.ipv4.tcp_notsent_lowat`. Under which version "
+            "gate isn't checked.",
             "  - Not in the template or its helpers: `net.ipv4.tcp_slow_start_after_idle`",
         ], issue.sections["Kyverno impact"])
         actions = issue.sections["Required actions"]
         self.assertAllIn([f"- [ ] Update `{self.SYSCTLS}` for the upstream `sysctls` change:",
                           "  - [ ] Handle `net.ipv4.tcp_slow_start_after_idle`",
-                          f"  - [ ] Add or update a CLI test under `{self.SYSCTLS_TEST}`."], actions)
+                          f"  - [ ] Add or update a CLI test under `{self.SYSCTLS_TEST}`.",
+                          # Without a line for the version, make verify-policies-sysctls wouldn't check the change.
+                          f"  - [ ] Update the expected names in `{psa.SYSCTLS_SCRIPT}`, with a `check v1.37.0` line, "
+                          "so `make verify-policies-sysctls` checks this change."], actions)
         # Don't ask for work that the template already has.
         self.assertNotIn("Handle `net.ipv4.tcp_notsent_lowat`", actions)
         self.assertAllIn([
-            "- [ ] Each upstream `pass` and `fail` fixture in `test/testdata/` for `sysctls` at `v1.38.0`",
+            "- [ ] Each upstream `pass` and `fail` fixture in `test/testdata/*/v1.38/` for `sysctls` gets the same "
+            "result from the updated policy. `make verify-policies-sysctls` checks the sysctls allow-list; compare "
+            "any other fixture by hand.",
             "- [ ] The PSS CLI tests pass with `make test-cli-local-vpols`.",
             "- [ ] Behavior that starts at Kubernetes `1.37` is gated with `semverCompare`",
-            "- [ ] `make verify-policies-sysctls` passes.",
-            "- [ ] `helm template charts/kyverno-policies` renders with `--kube-version 1.25.0` and with "
-            "`--kube-version 1.38.0`.",
+            "- [ ] `make verify-policies-sysctls` passes, and its output lists `v1.37.0`.",
+            "- [ ] `helm template charts/kyverno-policies` renders with `--kube-version v1.25.0` and with "
+            "`--kube-version v1.38.0`.",
         ], issue.sections["Validation"])
         self.assertAllIn([f"https://github.com/kubernetes/kubernetes/commit/{K8S_SHA}",
                           # Upstream text can't ping people or link Kyverno issues.
@@ -424,17 +443,20 @@ class AnalyzeTest(Base):
         issue = self.change({"policy/check_sysctls.go": check_sysctls(gate=37, values=["net.ipv4.tcp_notsent_lowat"])})
         self.assertTrue(issue.mapped[0]["handled"])
         self.assertEqual((issue.uncertain, issue.kind), ([], "confirm"))
-        self.assertIn("because the templates already seem to handle it", issue.sections["Summary"])
-        self.assertIn("mapped from upstream check `sysctls`: may already handle the change",
-                      issue.sections["Kyverno impact"])
-        # The "already handled" result is an inference, and the issue says so.
-        self.assertIn("**Assessment.** These are inferences, not verified results:", issue.sections["Kyverno impact"])
-        self.assertIn("may already handle this change", issue.notes[0])
+        self.assertIn("because the templates already seem to handle the upstream changes to `sysctls`,",
+                      issue.sections["Summary"])
+        # The "already handled" result is an inference, and the issue says so once.
+        impact = issue.sections["Kyverno impact"]
+        self.assertIn("mapped from upstream check `sysctls`: may already handle the change. This is an inference:",
+                      impact)
+        self.assertEqual(impact.count("may already handle"), 1)
         self.assertIn(f"- [ ] Confirm that `{self.SYSCTLS}` already matches the upstream `sysctls` change, and that "
                       f"`{self.SYSCTLS_TEST}` covers it.", issue.sections["Required actions"])
-        # The only check is that the upstream fixtures get the same result; no policy work.
-        self.assertIn("- [ ] Each upstream `pass` and `fail` fixture in `test/testdata/` for `sysctls` at `v1.38.0` "
-                      "gets the same result from `restrict-sysctls`.", issue.sections["Validation"])
+        # Checks that the template matches upstream, and no policy work.
+        self.assertAllIn(["- [ ] Each upstream `pass` and `fail` fixture in `test/testdata/*/v1.38/` for `sysctls` "
+                          "gets the same result from `restrict-sysctls`.",
+                          "- [ ] `make verify-policies-sysctls` passes, and its output lists `v1.37.0`."],
+                         issue.sections["Validation"])
         for text in self.IMPLEMENTATION:
             self.assertNotIn(text, issue.body)
 
@@ -445,11 +467,21 @@ class AnalyzeTest(Base):
         self.assertEqual(issue.analysis.signals["sysctls"]["removed_values"], ["kernel.shm_rmid_forced"])
         self.assertFalse(issue.mapped[0]["handled"])
         self.assertEqual(issue.kind, "update")
-        self.assertAllIn(["  - Already in the template or its helpers: `net.ipv4.tcp_notsent_lowat`, `>=1.37`",
+        self.assertAllIn(["  - Names already in the template or its helpers: `net.ipv4.tcp_notsent_lowat`.",
                           "  - Removed upstream, but still in the template: `kernel.shm_rmid_forced`"],
                          issue.sections["Kyverno impact"])
         self.assertIn("  - [ ] Decide whether `kernel.shm_rmid_forced`, which upstream removed, must stay",
                       issue.sections["Required actions"])
+
+    def test_a_confirm_issue_gives_every_reason(self):
+        # Like upstream 1.37: a handled check change and test-only changes in one release.
+        issue = self.change({"policy/check_sysctls.go": check_sysctls(gate=37, values=["net.ipv4.tcp_notsent_lowat"]),
+                             "test/run.go": "package test // v2\n"})
+        self.assertEqual(issue.kind, "confirm")
+        self.assertIn("because the templates already seem to handle the upstream changes to `sysctls` and only test "
+                      "code changed for `test-framework`,", issue.sections["Summary"])
+        self.assertAllIn(["- [ ] Confirm that `", "- [ ] Read the upstream test changes for `test-framework`"],
+                         issue.sections["Required actions"])
 
     def test_check_change_without_signals_needs_manual_review_not_an_update(self):
         issue = self.change({"policy/check_sysctls.go": check_sysctls() + "\nfunc helper() {}\n"})
@@ -472,6 +504,11 @@ class AnalyzeTest(Base):
         self.assertIn('  - [ ] Gate the change with `semverCompare ">=1.39.0-0"`, because upstream changes behavior '
                       'from 1.39.', issue.sections["Required actions"])
         self.assertIn("Behavior that starts at Kubernetes `1.39` is gated", issue.sections["Validation"])
+        # The sysctls script must check the version where upstream gates the change.
+        self.assertIn(f"  - [ ] Update the expected names in `{psa.SYSCTLS_SCRIPT}`, with a `check v1.39.0` line",
+                      issue.sections["Required actions"])
+        self.assertIn("- [ ] `make verify-policies-sysctls` passes, and its output lists `v1.39.0`.",
+                      issue.sections["Validation"])
         # Without the chart's minimum version, the issue doesn't make one up.
         self.assertIn("renders with the oldest Kubernetes version the chart supports", issue.sections["Validation"])
 
@@ -487,7 +524,7 @@ class AnalyzeTest(Base):
         self.assertEqual([u["subject"] for u in issue.uncertain], ["newThing", "api", "shared"])
         self.assertEqual(issue.kind, "manual")
         self.assertIn("(manual review)", issue.title)
-        self.assertIn("**Recommended action:** Resolve the 3 item(s) under **Not mapped**", issue.sections["Summary"])
+        self.assertIn("**Recommended action:** Resolve the 3 items under **Not mapped**", issue.sections["Summary"])
         impact = issue.sections["Kyverno impact"]
         self.assertAllIn(["- `newThing`: Upstream declares this check, but `checks`",
                           "- `api/`: Changes in `api/` can affect every check",
