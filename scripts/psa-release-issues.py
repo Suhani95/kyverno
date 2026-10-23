@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Opens one Kyverno issue for each Pod Security Admission (PSA) release that needs CEL policy work.
+"""Opens one Kyverno issue for each Pod Security Admission (PSA) minor release that needs CEL policy work.
 
-The script reads the kubernetes-1.* tags of the read-only PSA mirror, compares
-each release after the baseline in scripts/psa-release-issues.yaml with the
-previous relevant release, maps the changes to the PSS CEL templates, and opens
-an issue unless one exists. It stores no state. See
-docs/dev/psa-release-issues/README.md for the rules.
+The script reads the kubernetes-1.<minor>.0 tags of the read-only PSA mirror,
+compares each minor release after the baseline in scripts/psa-release-issues.yaml
+with the previous minor release, maps the changes to the PSS CEL templates, and
+opens an issue unless one exists. Patches and pre-releases are skipped. It stores
+no state. See docs/dev/psa-release-issues/README.md for the rules.
 
 Exit codes: 0 when every release was handled, 1 on an error.
 """
@@ -45,8 +45,8 @@ MAX_ISSUES_PER_RUN = 5
 MAX_BODY_CHARS = 65000
 MAX_LISTED_COMMITS = 50
 
-TAG_RE = re.compile(r"^kubernetes-1\.(\d+)\.(\d+)(?:-(alpha|beta|rc)\.(\d+))?$")
-PRE_ORDER = {"alpha": 0, "beta": 1, "rc": 2}
+# Only minor releases. Patches and pre-releases are skipped.
+TAG_RE = re.compile(r"^kubernetes-1\.(\d+)\.0$")
 FIXTURE_RE = re.compile(r"^test/testdata/(baseline|restricted)/v1\.(\d+)/(pass|fail)/([^/]+)\.yaml$")
 RELEVANT_PATHS = ["policy", "api", "test"]
 # Changes that make a release relevant. Test code is listed only as context.
@@ -100,7 +100,7 @@ def load_config(path):
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     since = data.get("since")
     if not isinstance(since, str) or not TAG_RE.match(since):
-        raise ReleaseError(f"{path}: since must be a kubernetes-1.<minor>.<patch> tag")
+        raise ReleaseError(f"{path}: since must be a kubernetes-1.<minor>.0 tag")
     checks = data.get("checks")
     if not isinstance(checks, dict) or not checks:
         raise ReleaseError(f"{path}: checks must be a non-empty map")
@@ -114,20 +114,19 @@ def load_config(path):
 
 
 class Release:
-    """A Kubernetes release, named by its kubernetes-1.* tag in the PSA mirror."""
+    """A Kubernetes minor release, named by its kubernetes-1.<minor>.0 tag in the PSA mirror."""
 
     def __init__(self, tag, date=None):
         match = TAG_RE.match(tag)
         if not match:
-            raise ValueError(f"not a release tag: {tag}")
+            raise ValueError(f"not a minor release tag: {tag}")
         self.tag = tag
         self.date = date
-        self.minor, self.patch = int(match.group(1)), int(match.group(2))
-        self.pre = (match.group(3), int(match.group(4))) if match.group(3) else None
+        self.minor = int(match.group(1))
 
     @property
     def version(self):
-        """The Kubernetes version, for example v1.37.0-rc.1."""
+        """The Kubernetes version, for example v1.38.0."""
         return "v" + self.tag[len("kubernetes-"):]
 
     @property
@@ -136,15 +135,14 @@ class Release:
         return self.version.replace("v1.", "v0.", 1)
 
     def key(self):
-        pre = (0, PRE_ORDER[self.pre[0]], self.pre[1]) if self.pre else (1, 0, 0)
-        return (self.minor, self.patch, *pre)
+        return self.minor
 
     def __repr__(self):
         return self.tag
 
 
 def parse_releases(text):
-    """Parses `git for-each-ref` lines of "<tag>\\x1f<ISO date>" into releases."""
+    """Parses `git for-each-ref` lines of "<tag>\\x1f<ISO date>" into minor releases."""
     releases = []
     for line in text.splitlines():
         tag, _, date = line.partition("\x1f")
@@ -153,27 +151,13 @@ def parse_releases(text):
     return sorted(releases, key=Release.key)
 
 
-def previous_release(release, releases, include_prereleases=True):
-    """Returns the release to compare with, or None.
-
-    A patch release follows the previous stable patch of its minor. A
-    pre-release or a vX.Y.0 release follows the previous tracked tag of its
-    minor, or v1.<minor - 1>.0 when the minor has no earlier tracked tag.
-    """
-    def tracked(r):
-        return include_prereleases or not r.pre
-
-    earlier = [r for r in releases if r.key() < release.key() and r.minor == release.minor and tracked(r)]
-    if release.patch > 0 and not release.pre:
-        earlier = [r for r in earlier if not r.pre]
-    if earlier:
-        return max(earlier, key=Release.key)
-    fallback = [r for r in releases if r.minor == release.minor - 1 and r.patch == 0 and not r.pre]
-    return fallback[0] if fallback else None
+def previous_release(release, releases):
+    """Returns v1.<minor - 1>.0 to compare with, or None."""
+    return next((r for r in releases if r.minor == release.minor - 1), None)
 
 
 def fetch_releases(git_bin, repository, dest):
-    """Fetches the mirror's kubernetes-1.* tags into a blobless clone and returns the releases."""
+    """Fetches the mirror's kubernetes-1.* tags into a blobless clone and returns the minor releases."""
     dest.mkdir(parents=True)
     git(git_bin, dest, "init", "-q")
     git(git_bin, dest, "remote", "add", "origin", repository)
@@ -839,21 +823,20 @@ def open_issue(github, release, title, body, labels):
 
 
 def select_releases(releases, args):
-    """Returns the releases to check: one tag, or every release published after the baseline."""
+    """Returns the releases to check: one tag, or every minor release after the baseline."""
     if args.tag:
         selected = [r for r in releases if r.tag == args.tag]
         if not selected:
             raise ReleaseError(f"tag {args.tag} isn't in {args.repository}")
         return selected
     baseline = next((r for r in releases if r.tag == args.since), None)
-    if not baseline or not baseline.date:
+    if not baseline:
         raise ReleaseError(f"baseline tag {args.since} isn't in {args.repository}")
-    # Dates, not versions: a patch for an older minor can come out after the baseline.
-    return [r for r in releases if r.date and r.date > baseline.date and (args.include_prereleases or not r.pre)]
+    return [r for r in releases if r.minor > baseline.minor]
 
 
 def run(args, github, chart, config, git_bin="git"):
-    """Checks every release after the baseline. Returns (summary lines, failures).
+    """Checks every minor release after the baseline. Returns (summary lines, failures).
 
     No state is stored: each run recomputes the result for every release after
     the baseline from the mirror's tags, and the issue markers record which
@@ -878,7 +861,7 @@ def run(args, github, chart, config, git_bin="git"):
                 if matching(issues, release):
                     summary.append(f"{line}: issue already exists (#{matching(issues, release)[0]})")
                     continue
-                previous = previous_release(release, releases, args.include_prereleases or bool(release.pre))
+                previous = previous_release(release, releases)
                 if not previous:
                     raise ReleaseError("no previous release to compare with; check this release by hand")
                 line += f" (since {code(previous.version)})"
@@ -919,10 +902,8 @@ def main(argv=None):
     parser.add_argument("--repo", required=True, help="the repository to open issues in, as OWNER/NAME")
     parser.add_argument("--out", required=True, help="directory for summary.md and the issue bodies")
     parser.add_argument("--dry-run", action="store_true", help="write the issues to --out instead of opening them")
-    parser.add_argument("--since", help="baseline tag: check releases published after it (default: since in --config)")
-    parser.add_argument("--skip-prereleases", dest="include_prereleases", action="store_false",
-                        help="skip alpha, beta, and rc releases")
-    parser.add_argument("--tag", help="check only this kubernetes-1.* tag")
+    parser.add_argument("--since", help="baseline tag: check the minor releases after it (default: since in --config)")
+    parser.add_argument("--tag", help="check only this kubernetes-1.<minor>.0 tag")
     parser.add_argument("--repository", default=DEFAULT_REPOSITORY,
                         help="the PSA mirror to read, https://github.com/OWNER/REPO (a fork for testing)")
     parser.add_argument("--config", default=str(CONFIG_FILE), help="baseline and check-to-policy map")
@@ -930,7 +911,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     for name in ("tag", "since"):
         if getattr(args, name) and not TAG_RE.match(getattr(args, name)):
-            parser.error(f"--{name} must look like kubernetes-1.<minor>.<patch>")
+            parser.error(f"--{name} must look like kubernetes-1.<minor>.0")
     try:
         # The URL goes to git remote add, and the issue links assume GitHub, so
         # allow only a GitHub repository URL. A fork works for testing.
@@ -945,7 +926,7 @@ def main(argv=None):
         print(f"ERROR: {err}")
         return 1
     mode = " (dry run)" if args.dry_run else ""
-    scope = f"release {args.tag}" if args.tag else f"releases published after {args.since}"
+    scope = f"release {args.tag}" if args.tag else f"minor releases after {args.since}"
     report = "\n".join([f"# Pod Security Admission release check{mode}", "", f"Checked {scope}.", "",
                         *(summary or ["- No new releases."]), ""])
     (out / "summary.md").write_text(report, encoding="utf-8")
