@@ -16,6 +16,8 @@
 # distinct behavior, and the script checks that every other version renders the same
 # policies as one of them. Run with --update to regenerate them after a chart change.
 # Every directory renders with podSecurityUserNamespaces=true.
+# `make verify-policies-psa-version-results` checks their expected results against
+# upstream PSA, and it relies on that setting.
 #
 # This needs no cluster: `helm template` renders locally.
 #
