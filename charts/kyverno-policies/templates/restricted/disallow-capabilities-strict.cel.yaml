@@ -13,6 +13,7 @@ metadata:
     policies.kyverno.io/minversion: 1.6.0
     kyverno.io/kyverno-version: {{ default .Chart.AppVersion (include "kyverno-policies.kyvernoVersion" .) }}
     kyverno.io/kubernetes-version: "{{ default .Chart.KubeVersion .Values.kubeVersionOverride }}"
+    kyverno.io/pod-security-version: "{{ include "kyverno-policies.psaVersionAnnotation" . }}"
     policies.kyverno.io/subject: Pod
     policies.kyverno.io/description: >-
       Adding capabilities other than `NET_BIND_SERVICE` is disallowed. In addition,
