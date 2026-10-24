@@ -977,6 +977,16 @@ verify-background-controller-rbac: helm-setup-dependency-charts ## Verify the ba
 	@echo Verify background controller RBAC... >&2
 	@HELM=$(HELM) KUBE_VERSION=$(KUBE_VERSION) ./scripts/verify-background-controller-rbac.sh
 
+.PHONY: verify-policies-psa-version
+verify-policies-psa-version: $(HELM) ## Verify the policies chart renders the PSA behavior for each podSecurityVersion and the pss-psa-version CLI test policies are up to date (no cluster needed)
+	@echo Verify podSecurityVersion rendering... >&2
+	@HELM=$(HELM) ./scripts/verify-policies-psa-version.sh
+
+.PHONY: verify-policies-psa-version-results
+verify-policies-psa-version-results: ## Verify the pss-psa-version CLI test expected results match upstream PSA (no cluster needed)
+	@echo Verify pss-psa-version expected results against upstream PSA... >&2
+	@cd ./hack/psa-test-results && go run . ../../test/cli/test-validating-policy/pss-psa-version
+
 .PHONY: verify-policies-sysctls
 verify-policies-sysctls: $(HELM) ## Verify the restrict-sysctls allow-list matches PSA for each Kubernetes version (no cluster needed)
 	@echo Verify restrict-sysctls allow-list... >&2

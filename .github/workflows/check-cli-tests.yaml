@@ -42,6 +42,9 @@ jobs:
       - name: Test CLI
         run: |
           VERSION=${{ github.ref_name }} make test-cli
+      - name: Verify PSA version test results
+        # Recomputes the pss-psa-version expected results with upstream PSA.
+        run: make verify-policies-psa-version-results
       - name: Test CLI (failures)
         run: |
           CLI_PATH=$PWD/cmd/cli/kubectl-kyverno/kubectl-kyverno

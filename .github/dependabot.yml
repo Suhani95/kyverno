@@ -5,6 +5,7 @@ updates:
       - /
       - /hack/controller-gen/
       - /hack/api-group-resources/
+      - /hack/psa-test-results/
     schedule:
       interval: daily
     rebase-strategy: disabled

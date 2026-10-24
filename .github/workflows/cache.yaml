@@ -39,6 +39,7 @@ jobs:
           go mod download && go mod tidy
           (cd hack/controller-gen && go mod download && go mod tidy)
           (cd hack/api-group-resources && go mod download && go mod tidy)
+          (cd hack/psa-test-results && go mod download && go mod tidy)
           make install-tools
       - name: Save gomod cache
         if: steps.check-gomod.outputs.cache-hit != 'true'
